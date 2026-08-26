@@ -1,0 +1,14 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local datasets, weights, and generated experiment artifacts
+datasets/
+checkpoints/
+baseline_diagnosis/
+baseline_metrics/
+baseline_predictions/
+candidate_bank/
+repro_runs/

@@ -1,0 +1,23 @@
+project: MSHNet-CCRR
+source_commit: 46cdfd46802629da51f70124662af7335be74b56
+seed: 42
+image_size: 256
+batch_size: 4
+epochs: 1000
+test_start_epoch: 500
+learning_rate: 0.05
+warm_epoch: 5
+optimizer: Adagrad
+evaluation_threshold: 0.5
+index_source: img_idx
+validation_split: null
+datasets:
+  IRSTD-1K:
+    root: datasets/IRSTD-1K
+    weight: checkpoints/baseline/IRSTD-1K_mshnet_baseline.pth
+  NUAA-SIRST:
+    root: datasets/NUAA-SIRST
+    weight: checkpoints/baseline/NUAA-SIRST_mshnet_baseline.pth
+  NUDT-SIRST:
+    root: datasets/NUDT-SIRST
+    weight: checkpoints/baseline/NUDT-SIRST_mshnet_baseline.pth

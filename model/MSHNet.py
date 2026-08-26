@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from model.ccrr import CCRRModule
+from utils.candidate import generate_candidates
+
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
         super(ChannelAttention, self).__init__()
@@ -65,7 +68,7 @@ class ResNet(nn.Module):
         return out
 
 class MSHNet(nn.Module):
-    def __init__(self, input_channels, block=ResNet):
+    def __init__(self, input_channels, block=ResNet, ccrr_config=None):
         super().__init__()
         param_channels = [16, 32, 64, 128, 256]
         param_blocks = [2, 2, 2, 2]
@@ -95,6 +98,12 @@ class MSHNet(nn.Module):
         self.output_3 = nn.Conv2d(param_channels[3], 1, 1)
 
         self.final = nn.Conv2d(4, 1, 3, 1, 1)
+        if ccrr_config is None:
+            self.ccrr = None
+        else:
+            ccrr_config = dict(ccrr_config)
+            ccrr_config.setdefault('feature_channels', param_channels[0])
+            self.ccrr = CCRRModule(**ccrr_config)
 
 
     def _make_layer(self, in_channels, out_channels, block, block_num=1):
@@ -104,7 +113,17 @@ class MSHNet(nn.Module):
             layer.append(block(out_channels, out_channels))
         return nn.Sequential(*layer)
 
-    def forward(self, x, warm_flag):
+    def forward(
+        self,
+        x,
+        warm_flag=True,
+        candidate_boxes=None,
+        candidate_masks=None,
+        enable_ccrr=False,
+        candidate_threshold=0.2,
+        min_candidate_area=1,
+        max_candidate_area=None,
+    ):
         x_e0 = self.encoder_0(self.conv_init(x))
         x_e1 = self.encoder_1(self.pool(x_e0))
         x_e2 = self.encoder_2(self.pool(x_e1))
@@ -118,17 +137,60 @@ class MSHNet(nn.Module):
         x_d0 = self.decoder_0(torch.cat([x_e0, self.up(x_d1)], 1))
 
         
-        if warm_flag:
+        if warm_flag or enable_ccrr:
             mask0 = self.output_0(x_d0)
             mask1 = self.output_1(x_d1)
             mask2 = self.output_2(x_d2)
             mask3 = self.output_3(x_d3)
-            output = self.final(torch.cat([mask0, self.up(mask1), self.up_4(mask2), self.up_8(mask3)], dim=1))
-            return [mask0, mask1, mask2, mask3], output
-    
+            multi_scale_logits = [mask0, mask1, mask2, mask3]
+            coarse_logits = self.final(
+                torch.cat(
+                    [mask0, self.up(mask1), self.up_4(mask2), self.up_8(mask3)],
+                    dim=1,
+                )
+            )
         else:
-            output = self.output_0(x_d0)
-            return [], output
+            coarse_logits = self.output_0(x_d0)
+            multi_scale_logits = []
 
-       
-    
+        outputs = {
+            'feature': x_d0,
+            'multi_scale_logits': multi_scale_logits,
+            'coarse_logits': coarse_logits,
+            'refined_logits': coarse_logits,
+            'candidate_outputs': None,
+        }
+
+        if not enable_ccrr:
+            return outputs
+
+        if self.ccrr is None:
+            raise RuntimeError('enable_ccrr=True requires ccrr_config when constructing MSHNet')
+
+        generated_candidates = None
+        if candidate_boxes is None:
+            generated_candidates = generate_candidates(
+                coarse_logits=coarse_logits,
+                multi_scale_logits=multi_scale_logits,
+                threshold_low=candidate_threshold,
+                min_area=min_candidate_area,
+                max_area=max_candidate_area,
+            )
+            candidate_boxes = generated_candidates
+
+        refined_logits, candidate_outputs = self.ccrr(
+            feature_map=x_d0,
+            coarse_logits=coarse_logits,
+            multi_scale_logits=multi_scale_logits,
+            candidate_boxes=candidate_boxes,
+            candidate_masks=candidate_masks,
+        )
+
+        if generated_candidates is not None:
+            for key, value in generated_candidates.items():
+                candidate_outputs.setdefault(key, value)
+
+        outputs['refined_logits'] = refined_logits
+        outputs['candidate_outputs'] = candidate_outputs
+        return outputs
+

@@ -1,0 +1,38 @@
+project: MSHNet-CCRR
+seed: 42
+stage: head_only
+num_classes: 2
+candidate:
+  threshold: 0.2
+  hard_negative_threshold: 0.5
+  hard_score: coarse_peak
+  positive_iou: 0.3
+  center_distance: 3.0
+  matching_rule: iou_or_center_inside_and_centroid_distance
+  min_area: 1
+  max_area: 1024
+model:
+  feature_channels: 16
+  num_scales: 4
+  roi_size: 7
+  hidden_dim: 128
+  context_scale: 3.0
+  max_delta: 4.0
+loss:
+  lambda_refined: 1.0
+  lambda_candidate: 1.0
+  lambda_calibration: 0.1
+  lambda_preservation: 0.2
+training:
+  epochs: 1000
+  test_start_epoch: 500
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  index_source: img_idx
+  validation_split: null
+  froc_bins: 100
+  checkpoint_schema: mshnet-ccrr-weight/v1
+  best_weights:
+    - best_pd.pkl
+    - best_miou.pkl
+  candidate_class_weights: auto_inverse_frequency

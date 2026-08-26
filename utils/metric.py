@@ -42,11 +42,11 @@ class ROCMetric():
 
     def reset(self):
 
-        self.tp_arr   = np.zeros([11])
-        self.pos_arr  = np.zeros([11])
-        self.fp_arr   = np.zeros([11])
-        self.neg_arr  = np.zeros([11])
-        self.class_pos= np.zeros([11])
+        self.tp_arr   = np.zeros([self.bins + 1])
+        self.pos_arr  = np.zeros([self.bins + 1])
+        self.fp_arr   = np.zeros([self.bins + 1])
+        self.neg_arr  = np.zeros([self.bins + 1])
+        self.class_pos= np.zeros([self.bins + 1])
 
 
 
@@ -114,6 +114,7 @@ class PD_FA():
     def reset(self):
         self.FA  = np.zeros([self.bins+1])
         self.PD  = np.zeros([self.bins+1])
+        self.target = np.zeros([self.bins+1])
 
 class mIoU():
 
@@ -214,4 +215,3 @@ def batch_intersection_union(output, target, nclass):
     assert (area_inter <= area_union).all(), \
         "Error: Intersection area should be smaller than Union area"
     return area_inter, area_union
-
