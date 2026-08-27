@@ -315,60 +315,111 @@ def _extract_scale_features(
 
 
 class CandidateContextEncoder(nn.Module):
-    """Encode core ROI, expanded context ROI, and their relationship."""
+    """Encode a candidate core and its surrounding (core-free) ring.
+
+    Core and ring deliberately share one low-capacity encoder.  This makes
+    their difference meaningful and avoids learning two independent feature
+    spaces from the small candidate training set.
+    """
 
     def __init__(
         self,
         feature_channels: int,
         num_scales: int = 4,
         roi_size: int | tuple[int, int] = 7,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
         context_scale: float = 3.0,
+        min_context_size: float = 15.0,
     ) -> None:
         super().__init__()
         if feature_channels <= 0 or hidden_dim <= 0 or num_scales <= 0:
             raise ValueError("feature_channels, hidden_dim, and num_scales must be positive")
         if context_scale <= 0:
             raise ValueError("context_scale must be positive")
+        if min_context_size <= 0:
+            raise ValueError("min_context_size must be positive")
 
         self.feature_channels = feature_channels
         self.num_scales = num_scales
         self.roi_size = roi_size
         self.hidden_dim = hidden_dim
         self.context_scale = float(context_scale)
+        self.min_context_size = float(min_context_size)
         self.output_dim = 4 * hidden_dim + num_scales + 1
 
-        def make_roi_encoder() -> nn.Sequential:
-            return nn.Sequential(
-                nn.Conv2d(feature_channels, hidden_dim, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(1),
-            )
+        # Prefer four groups as proposed for V1, while retaining support for
+        # small/non-multiple-of-four dimensions used by callers and tests.
+        num_groups = next(
+            groups for groups in range(min(4, hidden_dim), 0, -1)
+            if hidden_dim % groups == 0
+        )
+        self.roi_encoder = nn.Sequential(
+            nn.Conv2d(feature_channels, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+        )
 
-        self.core_encoder = make_roi_encoder()
-        self.context_encoder = make_roi_encoder()
+    # Read-only compatibility aliases for code that inspected the V0 module.
+    # They do not register duplicate modules or duplicate state-dict entries.
+    @property
+    def core_encoder(self) -> nn.Module:
+        return self.roi_encoder
+
+    @property
+    def context_encoder(self) -> nn.Module:
+        return self.roi_encoder
 
     @staticmethod
-    def _expand_boxes(boxes: Tensor, scale: float, image_hw: tuple[int, int]) -> Tensor:
+    def _expand_boxes(
+        boxes: Tensor,
+        scale: float,
+        image_hw: tuple[int, int],
+        min_context_size: float = 0.0,
+    ) -> Tensor:
         image_h, image_w = image_hw
         coords = boxes[:, 1:]
         centers_x = (coords[:, 0] + coords[:, 2]) * 0.5
         centers_y = (coords[:, 1] + coords[:, 3]) * 0.5
-        widths = (coords[:, 2] - coords[:, 0]) * scale
-        heights = (coords[:, 3] - coords[:, 1]) * scale
+        widths = coords[:, 2] - coords[:, 0]
+        heights = coords[:, 3] - coords[:, 1]
+        expanded_widths = torch.maximum(
+            widths * scale,
+            widths.new_full(widths.shape, float(min_context_size)),
+        )
+        expanded_heights = torch.maximum(
+            heights * scale,
+            heights.new_full(heights.shape, float(min_context_size)),
+        )
         expanded = torch.stack(
             (
-                (centers_x - widths * 0.5).clamp(0, image_w),
-                (centers_y - heights * 0.5).clamp(0, image_h),
-                (centers_x + widths * 0.5).clamp(0, image_w),
-                (centers_y + heights * 0.5).clamp(0, image_h),
+                (centers_x - expanded_widths * 0.5).clamp(0, image_w),
+                (centers_y - expanded_heights * 0.5).clamp(0, image_h),
+                (centers_x + expanded_widths * 0.5).clamp(0, image_w),
+                (centers_y + expanded_heights * 0.5).clamp(0, image_h),
             ),
             dim=1,
         )
         return torch.cat((boxes[:, :1], expanded), dim=1)
+
+    @staticmethod
+    def _masks_from_boxes(candidate_boxes: Tensor, image_hw: tuple[int, int]) -> Tensor:
+        """Build rectangular masks for legacy encoder calls without masks."""
+
+        image_h, image_w = image_hw
+        rows = torch.arange(image_h, device=candidate_boxes.device)[None, :, None]
+        columns = torch.arange(image_w, device=candidate_boxes.device)[None, None, :]
+        coords = candidate_boxes[:, 1:]
+        return (
+            (columns >= coords[:, 0, None, None])
+            & (columns < coords[:, 2, None, None])
+            & (rows >= coords[:, 1, None, None])
+            & (rows < coords[:, 3, None, None])
+        )
 
     @staticmethod
     def _to_feature_coordinates(
@@ -389,6 +440,7 @@ class CandidateContextEncoder(nn.Module):
         candidate_boxes: Tensor,
         scale_features: Tensor | None = None,
         image_hw: tuple[int, int] | None = None,
+        candidate_masks: Tensor | None = None,
     ) -> Tensor:
         if feature_map.ndim != 4 or feature_map.shape[1] != self.feature_channels:
             raise ValueError(
@@ -419,7 +471,25 @@ class CandidateContextEncoder(nn.Module):
         if num_candidates == 0:
             return feature_map.new_empty((0, self.output_dim))
 
-        context_boxes = self._expand_boxes(candidate_boxes, self.context_scale, image_hw)
+        if candidate_masks is None:
+            candidate_masks = self._masks_from_boxes(candidate_boxes, image_hw)
+        else:
+            candidate_masks = candidate_masks.to(device=feature_map.device)
+            if candidate_masks.ndim == 4 and candidate_masks.shape[1] == 1:
+                candidate_masks = candidate_masks[:, 0]
+            if candidate_masks.ndim != 3 or candidate_masks.shape[0] != num_candidates:
+                raise ValueError("candidate_masks must have shape [N,H,W]")
+            if tuple(candidate_masks.shape[-2:]) != image_hw:
+                candidate_masks = F.interpolate(
+                    candidate_masks.unsqueeze(1).float(), size=image_hw, mode="nearest"
+                )[:, 0]
+
+        context_boxes = self._expand_boxes(
+            candidate_boxes,
+            self.context_scale,
+            image_hw,
+            self.min_context_size,
+        )
         feature_hw = tuple(feature_map.shape[-2:])
         core_feature_boxes = self._to_feature_coordinates(candidate_boxes, image_hw, feature_hw)
         context_feature_boxes = self._to_feature_coordinates(context_boxes, image_hw, feature_hw)
@@ -440,8 +510,30 @@ class CandidateContextEncoder(nn.Module):
             sampling_ratio=-1,
             aligned=True,
         )
-        core_features = self.core_encoder(core_rois)
-        context_features = self.context_encoder(context_rois)
+
+        # Each candidate mask is an independent one-item image for ROIAlign;
+        # therefore the ROI batch indices must be [0, ..., N-1], not the
+        # original feature-map batch indices stored in ``context_boxes``.
+        mask_boxes = context_boxes.clone()
+        mask_boxes[:, 0] = torch.arange(
+            num_candidates, device=mask_boxes.device, dtype=mask_boxes.dtype
+        )
+        core_mask_in_context = roi_align(
+            candidate_masks.to(dtype=feature_map.dtype).unsqueeze(1),
+            mask_boxes,
+            output_size=self.roi_size,
+            spatial_scale=1.0,
+            sampling_ratio=-1,
+            aligned=True,
+        ).clamp(0.0, 1.0)
+        # Remove every context sample touched by the aligned core mask.  A
+        # binary exclusion avoids boundary interpolation leaking core signal
+        # into what is described and tested as ring-only context.
+        ring_mask = (core_mask_in_context <= 0.0).to(context_rois.dtype)
+        ring_rois = context_rois * ring_mask
+
+        core_features = self.roi_encoder(core_rois)
+        context_features = self.roi_encoder(ring_rois)
         return torch.cat(
             (
                 core_features,
@@ -457,19 +549,33 @@ class CandidateContextEncoder(nn.Module):
 class ReliabilityHead(nn.Module):
     """Predict target/clutter, optionally with an uncertain third class."""
 
-    def __init__(self, input_dim: int, hidden_dim: int = 128, num_classes: int = 3) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 64,
+        num_classes: int = 3,
+        dropout: float = 0.3,
+        zero_effect_initialization: bool = True,
+    ) -> None:
         super().__init__()
         if input_dim <= 0 or hidden_dim <= 0:
             raise ValueError("input_dim and hidden_dim must be positive")
         if num_classes not in (2, 3):
             raise ValueError("num_classes must be 2 (MVP) or 3 (with uncertain class)")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must lie in [0,1)")
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.classifier = nn.Sequential(
+            nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, num_classes),
         )
+        if zero_effect_initialization:
+            nn.init.zeros_(self.classifier[-1].weight)
+            nn.init.zeros_(self.classifier[-1].bias)
 
     def forward(self, relation_features: Tensor) -> Tensor:
         if relation_features.ndim != 2 or relation_features.shape[1] != self.input_dim:
@@ -477,28 +583,43 @@ class ReliabilityHead(nn.Module):
         return self.classifier(relation_features)
 
 
-class InstanceLogitRectifier(nn.Module):
-    """Map candidate reliability back to the coarse logit map.
+class SafeClutterSuppressor(nn.Module):
+    """Apply a bounded, confidence-gated, non-positive candidate residual.
 
     The computation is out-of-place and fully differentiable with respect to
-    both ``coarse_logits`` and ``target_scores``.  Pixels outside all candidate
-    masks receive an exactly zero correction.
+    the input scores and logits.  Because every correction is non-positive,
+    the module cannot create a new positive response.
     """
 
-    def __init__(self, max_delta: float = 4.0, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        max_suppression: float = 1.5,
+        gate_margin: float = 0.5,
+        gate_temperature: float = 0.1,
+        eps: float = 1e-6,
+    ) -> None:
         super().__init__()
-        if max_delta <= 0 or eps <= 0 or eps >= 0.5:
-            raise ValueError("max_delta must be positive and eps must be in (0,0.5)")
-        self.max_delta = float(max_delta)
+        if max_suppression < 0:
+            raise ValueError("max_suppression must be non-negative")
+        if gate_temperature <= 0:
+            raise ValueError("gate_temperature must be positive")
+        if eps <= 0 or eps >= 0.5:
+            raise ValueError("eps must be in (0,0.5)")
+        self.max_suppression = float(max_suppression)
+        # Compatibility for diagnostics/checkpoints that refer to max_delta.
+        self.max_delta = self.max_suppression
+        self.gate_margin = float(gate_margin)
+        self.gate_temperature = float(gate_temperature)
         self.eps = float(eps)
 
     def forward(
         self,
         coarse_logits: Tensor,
         target_scores: Tensor,
+        clutter_scores: Tensor,
         candidate_masks: Tensor,
         batch_indices: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         if coarse_logits.ndim != 4 or coarse_logits.shape[1] != 1:
             raise ValueError("coarse_logits must have shape [B,1,H,W]")
         if candidate_masks.ndim == 2:
@@ -510,6 +631,8 @@ class InstanceLogitRectifier(nn.Module):
         num_candidates = candidate_masks.shape[0]
         if target_scores.ndim != 1 or target_scores.shape[0] != num_candidates:
             raise ValueError("target_scores must have shape [N]")
+        if clutter_scores.ndim != 1 or clutter_scores.shape[0] != num_candidates:
+            raise ValueError("clutter_scores must have shape [N]")
         if batch_indices is None:
             if coarse_logits.shape[0] != 1 and num_candidates:
                 raise ValueError("batch_indices are required for a multi-image batch")
@@ -526,7 +649,8 @@ class InstanceLogitRectifier(nn.Module):
             raise ValueError("batch_indices contain an index outside coarse_logits")
 
         if num_candidates == 0:
-            return coarse_logits, coarse_logits.new_empty((0,))
+            empty = coarse_logits.new_empty((0,))
+            return coarse_logits, empty, empty
 
         if tuple(candidate_masks.shape[-2:]) != tuple(coarse_logits.shape[-2:]):
             candidate_masks = F.interpolate(
@@ -538,14 +662,34 @@ class InstanceLogitRectifier(nn.Module):
             device=coarse_logits.device, dtype=coarse_logits.dtype
         )
         scores = target_scores.to(device=coarse_logits.device, dtype=coarse_logits.dtype)
+        clutter_scores = clutter_scores.to(
+            device=coarse_logits.device, dtype=coarse_logits.dtype
+        )
 
         candidate_logits = coarse_logits[batch_indices, 0]
         areas = masks.flatten(1).sum(dim=1)
         valid = areas > 0
-        mean_logits = (candidate_logits * masks).flatten(1).sum(dim=1) / areas.clamp_min(1)
-        calibrated_logits = torch.logit(scores.clamp(self.eps, 1.0 - self.eps))
-        deltas = (calibrated_logits - mean_logits).clamp(-self.max_delta, self.max_delta)
+        confidence_margin = clutter_scores - scores
+        evidence_gate = torch.sigmoid(
+            (confidence_margin - self.gate_margin) / self.gate_temperature
+        )
+        # Subtract the equal-evidence baseline before applying target
+        # protection.  Thus zero-initialized class logits (p_C == p_T) give
+        # an exact identity mapping rather than a small accidental decrease.
+        baseline_gate = torch.sigmoid(
+            scores.new_tensor(-self.gate_margin / self.gate_temperature)
+        )
+        maximum_evidence_gate = torch.sigmoid(
+            scores.new_tensor((1.0 - self.gate_margin) / self.gate_temperature)
+        )
+        normalized_evidence = (
+            (evidence_gate - baseline_gate)
+            / (maximum_evidence_gate - baseline_gate).clamp_min(self.eps)
+        ).clamp(0.0, 1.0)
+        gates = normalized_evidence * (1.0 - scores)
+        deltas = -self.max_suppression * gates
         deltas = torch.where(valid, deltas, torch.zeros_like(deltas))
+        gates = torch.where(valid, gates, torch.zeros_like(gates))
 
         candidate_probabilities = candidate_logits.sigmoid()
         masked_probabilities = candidate_probabilities * masks
@@ -558,6 +702,45 @@ class InstanceLogitRectifier(nn.Module):
         )
         correction = correction.index_add(0, batch_indices, per_candidate_correction)
         refined_logits = coarse_logits + correction.unsqueeze(1)
+        return refined_logits, deltas, gates
+
+
+class InstanceLogitRectifier(SafeClutterSuppressor):
+    """Backward-compatible name/call form for the V1 safe suppressor.
+
+    V0 callers supplied only target probability.  For binary reliability this
+    uniquely determines clutter probability, so the legacy signature remains
+    usable while inheriting V1's non-positive-delta guarantee.
+    """
+
+    def __init__(
+        self,
+        max_delta: float = 1.5,
+        eps: float = 1e-6,
+        gate_margin: float = 0.5,
+        gate_temperature: float = 0.1,
+    ) -> None:
+        super().__init__(
+            max_suppression=max_delta,
+            gate_margin=gate_margin,
+            gate_temperature=gate_temperature,
+            eps=eps,
+        )
+
+    def forward(
+        self,
+        coarse_logits: Tensor,
+        target_scores: Tensor,
+        candidate_masks: Tensor,
+        batch_indices: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        refined_logits, deltas, _ = super().forward(
+            coarse_logits,
+            target_scores,
+            1.0 - target_scores,
+            candidate_masks,
+            batch_indices,
+        )
         return refined_logits, deltas
 
 
@@ -569,28 +752,46 @@ class CCRRModule(nn.Module):
         feature_channels: int,
         num_scales: int = 4,
         roi_size: int | tuple[int, int] = 7,
-        hidden_dim: int = 128,
+        hidden_dim: int = 64,
         context_scale: float = 3.0,
-        max_delta: float = 4.0,
+        min_context_size: float = 15.0,
+        dropout: float = 0.3,
+        max_delta: float = 1.5,
+        max_suppression: float | None = None,
+        gate_margin: float = 0.5,
+        gate_temperature: float = 0.1,
         num_classes: int = 3,
         eps: float = 1e-6,
+        zero_effect_initialization: bool = True,
+        rectifier: str = "suppression_only",
     ) -> None:
         super().__init__()
         self.num_scales = num_scales
         self.num_classes = num_classes
+        if rectifier != "suppression_only":
+            raise ValueError("CCRR-V1 supports only rectifier='suppression_only'")
         self.encoder = CandidateContextEncoder(
             feature_channels=feature_channels,
             num_scales=num_scales,
             roi_size=roi_size,
             hidden_dim=hidden_dim,
             context_scale=context_scale,
+            min_context_size=min_context_size,
         )
         self.reliability_head = ReliabilityHead(
             input_dim=self.encoder.output_dim,
             hidden_dim=hidden_dim,
             num_classes=num_classes,
+            dropout=dropout,
+            zero_effect_initialization=zero_effect_initialization,
         )
-        self.rectifier = InstanceLogitRectifier(max_delta=max_delta, eps=eps)
+        suppression_limit = max_delta if max_suppression is None else max_suppression
+        self.rectifier = SafeClutterSuppressor(
+            max_suppression=suppression_limit,
+            gate_margin=gate_margin,
+            gate_temperature=gate_temperature,
+            eps=eps,
+        )
 
     def forward(
         self,
@@ -648,6 +849,7 @@ class CCRRModule(nn.Module):
         relation_features = self.encoder(
             feature_map,
             boxes,
+            candidate_masks=masks,
             scale_features=scale_features,
             image_hw=output_hw,
         )
@@ -660,9 +862,10 @@ class CCRRModule(nn.Module):
         else:
             uncertain_scores = class_probs.new_zeros((class_probs.shape[0],))
 
-        refined_logits, deltas = self.rectifier(
+        refined_logits, deltas, gates = self.rectifier(
             coarse_logits,
             target_scores,
+            clutter_scores,
             masks,
             batch_indices,
         )
@@ -673,6 +876,7 @@ class CCRRModule(nn.Module):
             "clutter_scores": clutter_scores,
             "uncertain_scores": uncertain_scores,
             "deltas": deltas,
+            "gates": gates,
             "boxes": boxes,
             "candidate_masks": masks,
             "batch_indices": batch_indices,
@@ -686,5 +890,6 @@ __all__ = [
     "CandidateContextEncoder",
     "ReliabilityHead",
     "InstanceLogitRectifier",
+    "SafeClutterSuppressor",
     "CCRRModule",
 ]

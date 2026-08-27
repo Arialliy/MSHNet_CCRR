@@ -94,7 +94,12 @@ class CandidateClassificationLoss(nn.Module):
         self.reduction = reduction
         self.label_smoothing = float(label_smoothing)
 
-    def forward(self, class_logits: Tensor, labels: Tensor) -> Tensor:
+    def forward(
+        self,
+        class_logits: Tensor,
+        labels: Tensor,
+        sample_weights: Tensor | None = None,
+    ) -> Tensor:
         if class_logits.ndim != 2:
             raise ValueError(
                 f"class_logits must have shape [N, C], got {tuple(class_logits.shape)}"
@@ -134,6 +139,37 @@ class CandidateClassificationLoss(nn.Module):
                 device=class_logits.device,
                 dtype=class_logits.dtype,
             )
+
+        effective_weights = None
+        if sample_weights is not None:
+            effective_weights = torch.as_tensor(
+                sample_weights,
+                device=class_logits.device,
+                dtype=class_logits.dtype,
+            )
+            if effective_weights.ndim != 1 or effective_weights.shape[0] != num_candidates:
+                raise ValueError("sample_weights must have shape [N]")
+            if not torch.isfinite(effective_weights).all():
+                raise ValueError("sample_weights must be finite")
+            if (effective_weights < 0).any():
+                raise ValueError("sample_weights must be non-negative")
+            effective_weights = effective_weights * valid.to(class_logits.dtype)
+
+            per_candidate = F.cross_entropy(
+                class_logits,
+                labels,
+                weight=weights,
+                ignore_index=self.ignore_index,
+                reduction="none",
+                label_smoothing=self.label_smoothing,
+            )
+            weighted = per_candidate * effective_weights
+            if self.reduction == "none":
+                return weighted
+            if self.reduction == "sum":
+                return weighted.sum()
+            denominator = effective_weights.sum()
+            return weighted.sum() / denominator.clamp_min(1e-6)
 
         if self.reduction == "none":
             return F.cross_entropy(
@@ -191,6 +227,7 @@ class CandidateBrierLoss(nn.Module):
         self,
         predictions: Tensor,
         labels: Tensor,
+        sample_weights: Tensor | None = None,
         *,
         from_logits: bool | None = None,
     ) -> Tensor:
@@ -235,37 +272,68 @@ class CandidateBrierLoss(nn.Module):
         per_candidate = (probabilities - target).square().sum(dim=1)
         per_candidate = per_candidate.masked_fill(~valid, 0.0)
 
+        effective_weights = None
+        if sample_weights is not None:
+            effective_weights = torch.as_tensor(
+                sample_weights,
+                device=predictions.device,
+                dtype=predictions.dtype,
+            )
+            if effective_weights.ndim != 1 or effective_weights.shape[0] != num_candidates:
+                raise ValueError("sample_weights must have shape [N]")
+            if not torch.isfinite(effective_weights).all():
+                raise ValueError("sample_weights must be finite")
+            if (effective_weights < 0).any():
+                raise ValueError("sample_weights must be non-negative")
+            effective_weights = effective_weights * valid.to(predictions.dtype)
+            per_candidate = per_candidate * effective_weights
+
         if self.reduction == "none":
             return per_candidate
         if self.reduction == "sum":
             return per_candidate.sum()
+        if effective_weights is not None:
+            denominator = effective_weights.sum()
+            return per_candidate.sum() / denominator.clamp_min(1e-6)
         return per_candidate[valid].mean()
 
 
 class RectificationPreservationLoss(nn.Module):
     """Keep target responses while suppressing clutter after rectification.
 
-    Target candidates incur ``relu(p_coarse - p_refined)``.  Clutter
-    candidates incur ``relu(p_refined - p_coarse + margin)``.  Uncertain or
-    ignored candidates are omitted.  Logits can be supplied as ``[B, 1, H,
-    W]``, ``[B, H, W]`` or, for one image, ``[H, W]``.
+    Target candidates are protected at their peak response with
+    ``relu(peak_coarse - peak_refined - allowed_target_peak_drop)``.  Clutter
+    candidates incur ``relu(peak_refined - clutter_peak_ceiling)``.  Uncertain
+    or ignored candidates are omitted.  Logits can be supplied as ``[B, 1,
+    H, W]``, ``[B, H, W]`` or, for one image, ``[H, W]``.
     """
 
     def __init__(
         self,
-        margin: float = 0.1,
+        margin: float | None = None,
         *,
+        allowed_target_peak_drop: float = 0.01,
+        clutter_peak_ceiling: float = 0.45,
         target_label: int = 0,
         clutter_label: int = 1,
         ignore_index: int = -1,
         from_logits: bool = True,
     ) -> None:
         super().__init__()
-        if margin < 0:
+        # ``margin`` was the V0 mean-level clutter constraint.  Keep accepting
+        # it so old configuration dictionaries and call sites remain loadable;
+        # V1 always uses the explicit operating-point ceiling below.
+        if margin is not None and margin < 0:
             raise ValueError("margin must be non-negative")
+        if allowed_target_peak_drop < 0:
+            raise ValueError("allowed_target_peak_drop must be non-negative")
+        if not 0.0 <= clutter_peak_ceiling <= 1.0:
+            raise ValueError("clutter_peak_ceiling must lie in [0, 1]")
         if target_label == clutter_label:
             raise ValueError("target_label and clutter_label must differ")
-        self.margin = float(margin)
+        self.margin = None if margin is None else float(margin)
+        self.allowed_target_peak_drop = float(allowed_target_peak_drop)
+        self.clutter_peak_ceiling = float(clutter_peak_ceiling)
         self.target_label = int(target_label)
         self.clutter_label = int(clutter_label)
         self.ignore_index = int(ignore_index)
@@ -368,27 +436,38 @@ class RectificationPreservationLoss(nn.Module):
             coarse_values = coarse_values.sigmoid()
             refined_values = refined_values.sigmoid()
 
-        denominator = mask_area.clamp_min(torch.finfo(coarse.dtype).eps)
-        coarse_mean = (coarse_values * masks).sum(dim=(1, 2)) / denominator
-        refined_mean = (refined_values * masks).sum(dim=(1, 2)) / denominator
+        mask_membership = masks > 0
+        negative_infinity = torch.tensor(
+            float("-inf"), device=coarse.device, dtype=coarse.dtype
+        )
+        coarse_peak = coarse_values.masked_fill(
+            ~mask_membership, negative_infinity
+        ).amax(dim=(1, 2))
+        refined_peak = refined_values.masked_fill(
+            ~mask_membership, negative_infinity
+        ).amax(dim=(1, 2))
+        # Empty masks are excluded below.  Replacing their sentinel peaks keeps
+        # all intermediate and final values finite for diagnostics/backward.
+        coarse_peak = torch.where(nonempty, coarse_peak, torch.zeros_like(coarse_peak))
+        refined_peak = torch.where(nonempty, refined_peak, torch.zeros_like(refined_peak))
 
         valid = labels != self.ignore_index
         target_mask = valid & nonempty & (labels == self.target_label)
         clutter_mask = valid & nonempty & (labels == self.clutter_label)
 
-        zero = (coarse_mean.sum() + refined_mean.sum()) * 0.0
+        zero = (coarse_peak.sum() + refined_peak.sum()) * 0.0
         target_loss = zero
         if target_mask.any():
             target_loss = F.relu(
-                coarse_mean[target_mask] - refined_mean[target_mask]
+                coarse_peak[target_mask]
+                - refined_peak[target_mask]
+                - self.allowed_target_peak_drop
             ).mean()
 
         clutter_loss = zero
         if clutter_mask.any():
             clutter_loss = F.relu(
-                refined_mean[clutter_mask]
-                - coarse_mean[clutter_mask]
-                + self.margin
+                refined_peak[clutter_mask] - self.clutter_peak_ceiling
             ).mean()
 
         return target_loss + clutter_loss
@@ -407,7 +486,10 @@ class CCRRLoss(nn.Module):
         class_weights: Sequence[float] | Tensor | None = None,
         *,
         ignore_index: int = -1,
-        clutter_margin: float = 0.1,
+        clutter_margin: float | None = None,
+        label_smoothing: float = 0.0,
+        allowed_target_peak_drop: float = 0.01,
+        clutter_peak_ceiling: float = 0.45,
         classification_weight: float = 1.0,
         calibration_weight: float = 1.0,
         preservation_weight: float = 1.0,
@@ -424,6 +506,7 @@ class CCRRLoss(nn.Module):
         self.classification = CandidateClassificationLoss(
             class_weights,
             ignore_index=ignore_index,
+            label_smoothing=label_smoothing,
         )
         self.calibration = CandidateBrierLoss(
             from_logits=True,
@@ -431,6 +514,8 @@ class CCRRLoss(nn.Module):
         )
         self.preservation = RectificationPreservationLoss(
             margin=clutter_margin,
+            allowed_target_peak_drop=allowed_target_peak_drop,
+            clutter_peak_ceiling=clutter_peak_ceiling,
             ignore_index=ignore_index,
         )
         self.classification_weight = float(classification_weight)
@@ -445,10 +530,13 @@ class CCRRLoss(nn.Module):
         refined_logits: Tensor | None = None,
         candidate_masks: Tensor | None = None,
         candidate_batch_indices: Tensor | None = None,
+        sample_weights: Tensor | None = None,
     ) -> dict[str, Tensor]:
+        label_metadata: Mapping[str, Any] = {}
         if isinstance(candidate_labels, Mapping):
             if "labels" not in candidate_labels:
                 raise KeyError("candidate_labels mapping must contain 'labels'")
+            label_metadata = candidate_labels
             candidate_labels = candidate_labels["labels"]
         if not isinstance(candidate_labels, Tensor):
             raise TypeError("candidate_labels must be a tensor or a mapping containing one")
@@ -466,8 +554,15 @@ class CCRRLoss(nn.Module):
         else:
             raise TypeError("candidate_outputs must be a tensor or mapping")
 
-        classification = self.classification(class_logits, candidate_labels)
-        calibration = self.calibration(class_logits, candidate_labels)
+        if sample_weights is None:
+            sample_weights = label_metadata.get("sample_weights")
+        if sample_weights is None:
+            sample_weights = outputs.get("sample_weights")
+
+        classification = self.classification(
+            class_logits, candidate_labels, sample_weights
+        )
+        calibration = self.calibration(class_logits, candidate_labels, sample_weights)
 
         if candidate_masks is None:
             candidate_masks = outputs.get("candidate_masks")

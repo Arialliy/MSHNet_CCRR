@@ -1,5 +1,13 @@
 # MSHNet-CCRR execution guide
 
+> **V1 notice (2026-08-27):** The fixed-bank, 1000-epoch protocol below is
+> retained as the V0 diagnostic record. New experiments must follow
+> [README_CCRR_V1.md](README_CCRR_V1.md): online candidates, full candidate
+> supervision, ring context, and suppression-only rectification. Per the
+> project protocol, V1 keeps the existing 800/201 train/test manifests with no
+> validation split and saves test-selected `best_miou.pkl`/`best_pd.pkl`. V0
+> weights must not initialize `joint` training.
+
 This repository implements the Candidate--Context Reliability Rectification
 (CCRR) workflow described in the
 [design and implementation guide](Paper1_MSHNet_CCRR_方案总结与代码修改步骤.md).

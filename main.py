@@ -27,12 +27,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as Data
 from torch.optim import Adagrad, AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from model.MSHNet import MSHNet
 from model.candidate_loss import CCRRLoss
 from model.loss import AverageMeter, SLSIoULoss
 from utils.candidate import (
+    CLUTTER_LABEL,
     LABEL_NAMES,
     TARGET_LABEL,
     UNCERTAIN_LABEL,
@@ -53,7 +55,7 @@ from utils.reliability_metric import (
 
 
 CANDIDATE_BANK_SCHEMA_VERSION = "mshnet-ccrr-candidate-bank/v1"
-WEIGHT_SCHEMA_VERSION = "mshnet-ccrr-weight/v1"
+WEIGHT_SCHEMA_VERSION = "mshnet-ccrr-weight/v2-safe"
 
 
 def str2bool(value: Any) -> bool:
@@ -105,13 +107,7 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
         "--ccrr-stage", choices=("head_only", "joint"), default="head_only"
     )
     parser.add_argument("--candidate-bank", default="")
-    parser.add_argument(
-        "--test-candidate-bank",
-        "--val-candidate-bank",
-        dest="test_candidate_bank",
-        default="",
-        help="Optional final-test bank; final testing falls back to online candidates.",
-    )
+    parser.add_argument("--test-candidate-bank", default="")
     parser.add_argument("--candidate-threshold", type=float, default=0.2)
     parser.add_argument("--hard-negative-threshold", type=float, default=0.5)
     parser.add_argument(
@@ -127,18 +123,32 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
 
     # CCRR model and optimization.
     parser.add_argument("--roi-size", type=int, default=7)
-    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--context-scale", type=float, default=3.0)
-    parser.add_argument("--max-delta", type=float, default=4.0)
+    parser.add_argument("--min-context-size", type=float, default=15.0)
+    parser.add_argument("--ccrr-dropout", type=float, default=0.3)
+    parser.add_argument(
+        "--max-delta", "--max-suppression", dest="max_delta", type=float, default=1.5
+    )
+    parser.add_argument("--gate-margin", type=float, default=0.5)
+    parser.add_argument("--gate-temperature", type=float, default=0.1)
     parser.add_argument("--ccrr-num-classes", type=int, choices=(2, 3), default=2)
-    parser.add_argument("--ccrr-lr", type=float, default=1e-3)
+    parser.add_argument("--ccrr-lr", type=float, default=3e-4)
     parser.add_argument("--backbone-lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--lambda-refined", type=float, default=1.0)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--scheduler", choices=("none", "cosine"), default="cosine")
+    parser.add_argument("--eta-min", type=float, default=1e-6)
+    parser.add_argument("--lambda-refined", type=float, default=0.5)
     parser.add_argument("--lambda-candidate", type=float, default=1.0)
-    parser.add_argument("--lambda-calibration", type=float, default=0.1)
-    parser.add_argument("--lambda-preservation", type=float, default=0.2)
+    parser.add_argument("--lambda-calibration", type=float, default=0.05)
+    parser.add_argument("--lambda-preservation", type=float, default=1.0)
     parser.add_argument("--clutter-margin", type=float, default=0.1)
+    parser.add_argument("--easy-negative-weight", type=float, default=0.5)
+    parser.add_argument("--hard-negative-weight", type=float, default=2.0)
+    parser.add_argument("--hardness-gamma", type=float, default=2.0)
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--target-allowed-peak-drop", type=float, default=0.01)
+    parser.add_argument("--clutter-peak-ceiling", type=float, default=0.45)
     parser.add_argument(
         "--candidate-class-weights",
         type=float,
@@ -150,13 +160,7 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     # Bounded runs make integration checks reproducible without changing the
     # behavior of full experiments (zero means unlimited).
     parser.add_argument("--max-train-batches", type=int, default=0)
-    parser.add_argument(
-        "--max-test-batches",
-        "--max-val-batches",
-        dest="max_test_batches",
-        type=int,
-        default=0,
-    )
+    parser.add_argument("--max-test-batches", type=int, default=0)
     return parser.parse_args()
 
 
@@ -201,6 +205,194 @@ def should_run_scheduled_test(epoch: int, test_start_epoch: int) -> bool:
     """The schedule is zero-based: epoch 500 is the first tested epoch."""
 
     return int(epoch) >= int(test_start_epoch)
+
+
+def _binary_candidate_metrics(
+    probabilities: np.ndarray, labels: np.ndarray
+) -> dict[str, Any]:
+    """Binary target/clutter metrics with clutter treated as positive."""
+
+    labels = np.asarray(labels, dtype=np.int64)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if labels.size == 0:
+        return {"num_candidates": 0}
+    predictions = probabilities.argmax(axis=1)
+    confusion = np.zeros((2, 2), dtype=np.int64)
+    for truth, prediction in zip(labels, predictions, strict=True):
+        if truth in (TARGET_LABEL, CLUTTER_LABEL) and prediction in (
+            TARGET_LABEL,
+            CLUTTER_LABEL,
+        ):
+            confusion[int(truth), int(prediction)] += 1
+
+    def ratio(numerator: float, denominator: float) -> float:
+        return float(numerator / denominator) if denominator else float("nan")
+
+    target_recall = ratio(confusion[0, 0], confusion[0].sum())
+    clutter_recall = ratio(confusion[1, 1], confusion[1].sum())
+    clutter_precision = ratio(confusion[1, 1], confusion[:, 1].sum())
+    clutter_f1 = ratio(
+        2.0 * clutter_precision * clutter_recall,
+        clutter_precision + clutter_recall,
+    )
+
+    positives = labels == CLUTTER_LABEL
+    negatives = labels == TARGET_LABEL
+    auroc = float("nan")
+    auprc = float("nan")
+    if positives.any() and negatives.any():
+        scores = probabilities[:, CLUTTER_LABEL]
+        order = np.argsort(-scores, kind="mergesort")
+        sorted_scores = scores[order]
+        sorted_positive = positives[order]
+        group_ends = np.flatnonzero(
+            np.r_[sorted_scores[1:] != sorted_scores[:-1], True]
+        )
+        cumulative_tp = np.cumsum(sorted_positive)[group_ends].astype(np.float64)
+        cumulative_fp = (
+            np.cumsum(~sorted_positive)[group_ends].astype(np.float64)
+        )
+        recall = cumulative_tp / positives.sum()
+        false_positive_rate = cumulative_fp / negatives.sum()
+        precision = cumulative_tp / np.maximum(cumulative_tp + cumulative_fp, 1.0)
+        auroc = float(
+            np.trapezoid(
+                np.r_[0.0, recall],
+                np.r_[0.0, false_positive_rate],
+            )
+        )
+        auprc = float(np.sum(np.diff(np.r_[0.0, recall]) * precision))
+
+    recalls = np.asarray([target_recall, clutter_recall], dtype=np.float64)
+    return {
+        "num_candidates": int(labels.size),
+        "confusion_matrix": confusion.tolist(),
+        "target_recall": target_recall,
+        "clutter_recall": clutter_recall,
+        "clutter_precision": clutter_precision,
+        "clutter_f1": clutter_f1,
+        "balanced_accuracy": float(np.nanmean(recalls)),
+        "AUROC_clutter": auroc,
+        "AUPRC_clutter": auprc,
+    }
+
+
+def _delta_statistics(
+    deltas: np.ndarray,
+    labels: np.ndarray,
+    max_suppression: float,
+) -> dict[str, Any]:
+    deltas = np.asarray(deltas, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64)
+
+    def one_class(mask: np.ndarray) -> dict[str, Any]:
+        values = deltas[mask]
+        if values.size == 0:
+            return {"count": 0}
+        return {
+            "count": int(values.size),
+            "mean": float(values.mean()),
+            "median": float(np.median(values)),
+            "min": float(values.min()),
+            "max": float(values.max()),
+            "positive_fraction": float(np.mean(values > 1e-8)),
+            "negative_fraction": float(np.mean(values < -1e-8)),
+            "saturation_fraction": float(
+                np.mean(np.isclose(np.abs(values), max_suppression, atol=1e-5))
+            ),
+        }
+
+    target = one_class(labels == TARGET_LABEL)
+    clutter = one_class(labels == CLUTTER_LABEL)
+    return {
+        "target": target,
+        "clutter": clutter,
+        "target_suppressed_fraction": target.get("negative_fraction", float("nan")),
+        "clutter_unsuppressed_fraction": (
+            1.0 - clutter["negative_fraction"]
+            if "negative_fraction" in clutter
+            else float("nan")
+        ),
+    }
+
+
+def _detection_transition_counts(
+    coarse_logits: torch.Tensor,
+    refined_logits: torch.Tensor,
+    labels: torch.Tensor,
+    center_distance: float,
+) -> dict[str, int]:
+    totals = {
+        "coarse_detected_refined_missed_targets": 0,
+        "coarse_missed_refined_detected_targets": 0,
+        "eliminated_fp_components": 0,
+        "new_fp_components": 0,
+    }
+    coarse_binary = (coarse_logits[:, 0] > 0).detach().cpu().numpy()
+    refined_binary = (refined_logits[:, 0] > 0).detach().cpu().numpy()
+    truth_binary = (labels[:, 0] > 0).detach().cpu().numpy()
+    for coarse_mask, refined_mask, truth_mask in zip(
+        coarse_binary, refined_binary, truth_binary, strict=True
+    ):
+        gt_labels = connected_components(truth_mask, connectivity=2)
+        coarse_labels = connected_components(coarse_mask, connectivity=2)
+        refined_labels = connected_components(refined_mask, connectivity=2)
+
+        def centroids(component_map: np.ndarray) -> list[np.ndarray]:
+            return [
+                np.argwhere(component_map == index).mean(axis=0)
+                for index in range(1, int(component_map.max()) + 1)
+            ]
+
+        gt_centroids = centroids(gt_labels)
+        coarse_centroids = centroids(coarse_labels)
+        refined_centroids = centroids(refined_labels)
+
+        def detected(gt: np.ndarray, predictions: list[np.ndarray]) -> bool:
+            return any(
+                np.linalg.norm(prediction - gt) <= float(center_distance)
+                for prediction in predictions
+            )
+
+        for gt in gt_centroids:
+            coarse_hit = detected(gt, coarse_centroids)
+            refined_hit = detected(gt, refined_centroids)
+            totals["coarse_detected_refined_missed_targets"] += int(
+                coarse_hit and not refined_hit
+            )
+            totals["coarse_missed_refined_detected_targets"] += int(
+                refined_hit and not coarse_hit
+            )
+
+        def false_positive_ids(
+            component_map: np.ndarray, predictions: list[np.ndarray]
+        ) -> list[int]:
+            return [
+                index
+                for index, prediction in enumerate(predictions, start=1)
+                if not any(
+                    np.linalg.norm(prediction - gt) <= float(center_distance)
+                    for gt in gt_centroids
+                )
+            ]
+
+        coarse_fp = false_positive_ids(coarse_labels, coarse_centroids)
+        refined_fp = false_positive_ids(refined_labels, refined_centroids)
+        totals["eliminated_fp_components"] += sum(
+            not any(
+                np.any((coarse_labels == coarse_id) & (refined_labels == refined_id))
+                for refined_id in refined_fp
+            )
+            for coarse_id in coarse_fp
+        )
+        totals["new_fp_components"] += sum(
+            not any(
+                np.any((refined_labels == refined_id) & (coarse_labels == coarse_id))
+                for coarse_id in coarse_fp
+            )
+            for refined_id in refined_fp
+        )
+    return totals
 
 
 class CandidateBank:
@@ -468,26 +660,23 @@ class Trainer:
             if args.enable_ccrr and args.mode == "train" and args.candidate_bank
             else None
         )
-        evaluation_bank_path = args.test_candidate_bank
-        if args.mode == "test" and not evaluation_bank_path:
-            evaluation_bank_path = args.candidate_bank
-        self.eval_candidate_bank = (
-            CandidateBank(evaluation_bank_path, args.base_size)
-            if args.enable_ccrr and evaluation_bank_path
+        test_bank_path = args.test_candidate_bank
+        if args.mode == "test" and not test_bank_path:
+            test_bank_path = args.candidate_bank
+        self.test_candidate_bank = (
+            CandidateBank(test_bank_path, args.base_size)
+            if args.enable_ccrr and test_bank_path
             else None
         )
 
         self.train_loader: Data.DataLoader | None = None
         if args.mode == "train":
-            # Offline candidates are in the canonical resized coordinate
-            # system, so the frozen-head stage deliberately disables random
-            # geometric augmentation.
-            if args.enable_ccrr and (
-                args.ccrr_stage == "head_only" or args.candidate_bank
-            ):
+            # Only an offline bank requires canonical, augmentation-free
+            # coordinates.  Online V1 candidates follow the augmented image.
+            if args.enable_ccrr and args.candidate_bank:
                 train_source = IRSTD_Dataset(args, mode="test", split="train")
             else:
-                train_source = IRSTD_Dataset(args, mode="train")
+                train_source = IRSTD_Dataset(args, mode="train", split="train")
             trainset: Data.Dataset = train_source
             self.train_loader = Data.DataLoader(
                 trainset,
@@ -508,8 +697,8 @@ class Trainer:
         )
         self.split_summary = {
             "validation_source": None,
-            "evaluation_source": "test",
-            "used_for_model_selection": args.mode == "train",
+            "evaluation_source": "official_test",
+            "model_selection_source": "test" if args.mode == "train" else None,
             "num_train_images": len(self.train_loader.dataset)
             if self.train_loader is not None
             else None,
@@ -523,8 +712,8 @@ class Trainer:
                 expected_split="train",
                 expected_names=self._dataset_names(self.train_loader.dataset),
             )
-        if self.eval_candidate_bank is not None:
-            self.eval_candidate_bank.validate_contract(
+        if self.test_candidate_bank is not None:
+            self.test_candidate_bank.validate_contract(
                 args,
                 expected_split="test",
                 expected_names=self._dataset_names(self.test_loader.dataset),
@@ -537,7 +726,11 @@ class Trainer:
                 "roi_size": args.roi_size,
                 "hidden_dim": args.hidden_dim,
                 "context_scale": args.context_scale,
+                "min_context_size": args.min_context_size,
+                "dropout": args.ccrr_dropout,
                 "max_delta": args.max_delta,
+                "gate_margin": args.gate_margin,
+                "gate_temperature": args.gate_temperature,
                 "num_classes": args.ccrr_num_classes,
             }
         model: nn.Module = MSHNet(3, ccrr_config=ccrr_config)
@@ -549,6 +742,7 @@ class Trainer:
         self.model = model.to(self.device)
         self._configure_trainable_parameters()
         self.optimizer = self._build_optimizer()
+        self.scheduler = self._build_scheduler()
 
         self.loss_fun = SLSIoULoss()
         self.ccrr_loss: CCRRLoss | None = None
@@ -565,6 +759,9 @@ class Trainer:
                 class_weights=class_weights,
                 ignore_index=-1,
                 clutter_margin=args.clutter_margin,
+                label_smoothing=args.label_smoothing,
+                allowed_target_peak_drop=args.target_allowed_peak_drop,
+                clutter_peak_ceiling=args.clutter_peak_ceiling,
                 classification_weight=1.0,
                 calibration_weight=1.0,
                 preservation_weight=1.0,
@@ -617,11 +814,36 @@ class Trainer:
             raise ValueError("--epochs must be positive")
         if self.args.test_start_epoch < 0:
             raise ValueError("--test-start-epoch must be non-negative")
+        if self.args.hidden_dim <= 0:
+            raise ValueError("--hidden-dim must be positive")
+        if self.args.min_context_size <= 0 or self.args.context_scale <= 0:
+            raise ValueError("context sizes must be positive")
+        if not 0.0 <= self.args.ccrr_dropout < 1.0:
+            raise ValueError("--ccrr-dropout must lie in [0, 1)")
+        if self.args.max_delta < 0:
+            raise ValueError("--max-delta/--max-suppression must be non-negative")
+        if self.args.gate_temperature <= 0:
+            raise ValueError("--gate-temperature must be positive")
+        if self.args.easy_negative_weight < 0 or self.args.hard_negative_weight < 0:
+            raise ValueError("negative sample weights must be non-negative")
+        if self.args.hard_negative_weight < self.args.easy_negative_weight:
+            raise ValueError("--hard-negative-weight must be >= --easy-negative-weight")
+        if self.args.hardness_gamma < 0:
+            raise ValueError("--hardness-gamma must be non-negative")
+        if not 0.0 <= self.args.label_smoothing <= 1.0:
+            raise ValueError("--label-smoothing must lie in [0, 1]")
+        if not 0.0 <= self.args.target_allowed_peak_drop <= 1.0:
+            raise ValueError("--target-allowed-peak-drop must lie in [0, 1]")
+        if not 0.0 <= self.args.clutter_peak_ceiling <= 1.0:
+            raise ValueError("--clutter-peak-ceiling must lie in [0, 1]")
         if (
             self.args.mode == "train"
             and self.args.enable_ccrr
             and self.args.ccrr_stage == "joint"
-            and (self.args.candidate_bank or self.args.test_candidate_bank)
+            and (
+                self.args.candidate_bank
+                or self.args.test_candidate_bank
+            )
         ):
             raise ValueError(
                 "joint training updates proposal logits and therefore requires "
@@ -670,7 +892,7 @@ class Trainer:
 
     def _inference_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {
-            "schema_version": "mshnet-ccrr-inference/v1",
+            "schema_version": "mshnet-ccrr-inference/v2-safe",
             "model_variant": "MSHNet+CCRR" if self.args.enable_ccrr else "MSHNet",
             "enable_ccrr": bool(self.args.enable_ccrr),
             "input_channels": 3,
@@ -690,16 +912,21 @@ class Trainer:
                     "roi_size": int(self.args.roi_size),
                     "hidden_dim": int(self.args.hidden_dim),
                     "context_scale": float(self.args.context_scale),
+                    "min_context_size": float(self.args.min_context_size),
+                    "ccrr_dropout": float(self.args.ccrr_dropout),
                     "max_delta": float(self.args.max_delta),
+                    "rectifier": "suppression_only",
+                    "gate_margin": float(self.args.gate_margin),
+                    "gate_temperature": float(self.args.gate_temperature),
                     "ccrr_num_classes": int(self.args.ccrr_num_classes),
                 }
             )
         return config
 
     def _evaluation_config(self) -> dict[str, Any]:
-        bank = self.eval_candidate_bank
+        bank = self.test_candidate_bank
         config: dict[str, Any] = {
-            "schema_version": "mshnet-ccrr-evaluation/v1",
+            "schema_version": "mshnet-ccrr-evaluation/v2-safe",
             "dataset_dir": str(Path(self.args.dataset_dir).resolve()),
             "test_split": self._dataset_contract(self.test_loader.dataset),
             "center_distance": float(self.args.center_distance),
@@ -728,8 +955,9 @@ class Trainer:
         )
         bank = self.train_candidate_bank
         config: dict[str, Any] = {
-            "schema_version": "mshnet-ccrr-training/v1",
+            "schema_version": "mshnet-ccrr-training/v2-safe",
             "batch_size": int(self.args.batch_size),
+            "epochs": int(self.args.epochs),
             "crop_size": int(self.args.crop_size),
             "warm_epoch": int(self.args.warm_epoch),
             "train_split": train_contract,
@@ -752,6 +980,19 @@ class Trainer:
                     "lambda_calibration": float(self.args.lambda_calibration),
                     "lambda_preservation": float(self.args.lambda_preservation),
                     "clutter_margin": float(self.args.clutter_margin),
+                    "training_label_mode": "target_presence",
+                    "easy_negative_weight": float(self.args.easy_negative_weight),
+                    "hard_negative_weight": float(self.args.hard_negative_weight),
+                    "hardness_gamma": float(self.args.hardness_gamma),
+                    "label_smoothing": float(self.args.label_smoothing),
+                    "target_allowed_peak_drop": float(
+                        self.args.target_allowed_peak_drop
+                    ),
+                    "clutter_peak_ceiling": float(self.args.clutter_peak_ceiling),
+                    "scheduler": self.args.scheduler,
+                    "eta_min": float(self.args.eta_min),
+                    "validation_split": None,
+                    "test_start_epoch": int(self.args.test_start_epoch),
                 }
             )
         return config
@@ -873,8 +1114,8 @@ class Trainer:
                 "train_candidate_bank_sha256": self.train_candidate_bank.sha256
                 if self.train_candidate_bank is not None
                 else None,
-                "test_candidate_bank_sha256": self.eval_candidate_bank.sha256
-                if self.eval_candidate_bank is not None
+                "test_candidate_bank_sha256": self.test_candidate_bank.sha256
+                if self.test_candidate_bank is not None
                 else None,
             },
         }
@@ -961,6 +1202,12 @@ class Trainer:
         self._state_model().load_state_dict(state_dict, strict=True)
         if isinstance(checkpoint, dict) and "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
+        if (
+            isinstance(checkpoint, dict)
+            and self.scheduler is not None
+            and checkpoint.get("scheduler") is not None
+        ):
+            self.scheduler.load_state_dict(checkpoint["scheduler"])
         if isinstance(checkpoint, dict):
             self.start_epoch = int(checkpoint.get("epoch", -1)) + 1
             self.best_iou = float(
@@ -987,7 +1234,7 @@ class Trainer:
     def _validate_candidate_bank_ancestry(self) -> None:
         banks = [
             ("train", self.train_candidate_bank),
-            ("test", self.eval_candidate_bank),
+            ("test", self.test_candidate_bank),
         ]
         for split, bank in banks:
             if bank is None:
@@ -1024,6 +1271,9 @@ class Trainer:
         checkpoint = {
             **weight_artifact,
             "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict()
+            if self.scheduler is not None
+            else None,
             "best_miou": self.best_iou,
             "best_pd": self.best_pd,
             "iou": self.best_iou,
@@ -1077,6 +1327,15 @@ class Trainer:
                 {"params": other_parameters, "lr": self.args.backbone_lr}
             )
         return AdamW(parameter_groups, weight_decay=self.args.weight_decay)
+
+    def _build_scheduler(self) -> CosineAnnealingLR | None:
+        if not self.args.enable_ccrr or self.args.scheduler == "none":
+            return None
+        return CosineAnnealingLR(
+            self.optimizer,
+            T_max=max(1, int(self.args.epochs)),
+            eta_min=float(self.args.eta_min),
+        )
 
     def _resolve_candidate_class_weights(self) -> list[float]:
         if self.args.candidate_class_weights is not None:
@@ -1151,10 +1410,27 @@ class Trainer:
             hard_negative_threshold=self.args.hard_negative_threshold,
             center_distance=self.args.center_distance,
         )
-        training_labels = matching["labels"].clone()
-        if self.args.ccrr_num_classes == 2:
-            training_labels[training_labels == UNCERTAIN_LABEL] = -1
+        strict_labels = matching["labels"].clone()
+        has_target = (matching["max_iou"] > 0) | matching["center_match"]
+        training_labels = torch.where(
+            has_target,
+            torch.full_like(strict_labels, TARGET_LABEL),
+            torch.full_like(strict_labels, CLUTTER_LABEL),
+        )
+        scores = matching["scores"].clamp(0.0, 1.0)
+        sample_weights = torch.ones_like(scores)
+        clutter_mask = training_labels == CLUTTER_LABEL
+        sample_weights[clutter_mask] = (
+            self.args.easy_negative_weight
+            + (
+                self.args.hard_negative_weight
+                - self.args.easy_negative_weight
+            )
+            * scores[clutter_mask].pow(self.args.hardness_gamma)
+        )
+        matching["strict_labels"] = strict_labels
         matching["training_labels"] = training_labels
+        matching["sample_weights"] = sample_weights
         return matching
 
     def _detection_loss(
@@ -1234,6 +1510,7 @@ class Trainer:
                     refined_logits=outputs["refined_logits"],
                     candidate_masks=outputs["candidate_outputs"]["candidate_masks"],
                     candidate_batch_indices=outputs["candidate_outputs"]["batch_indices"],
+                    sample_weights=matching["sample_weights"],
                 )
                 total_loss = (
                     coarse_loss
@@ -1265,6 +1542,11 @@ class Trainer:
         return count
 
     def test(self, epoch: int) -> dict[str, Any]:
+        split = "test"
+        loader = self.test_loader
+        candidate_bank = self.test_candidate_bank
+        max_batches = self.args.max_test_batches
+        select_weights = self.mode == "train"
         self.model.eval()
         coarse_metrics = DetectionMetrics(self.args.base_size)
         refined_metrics = DetectionMetrics(self.args.base_size)
@@ -1284,27 +1566,40 @@ class Trainer:
         paired_ccrr_probabilities: list[np.ndarray] = []
         raw_probabilities: list[np.ndarray] = []
         paired_labels: list[np.ndarray] = []
+        delta_values: list[np.ndarray] = []
+        delta_labels: list[np.ndarray] = []
+        candidate_records: list[dict[str, Any]] = []
+        per_image_candidate_ids: dict[str, int] = defaultdict(int)
+        detection_transitions: dict[str, int] = defaultdict(int)
         detection_records: list[tuple[float, float, int, int, int]] = []
         total_gt_targets = 0
         num_images = 0
-        maximum = self.args.max_test_batches or len(self.test_loader)
-        progress = tqdm(self.test_loader, total=min(len(self.test_loader), maximum))
+        maximum = max_batches or len(loader)
+        progress = tqdm(loader, total=min(len(loader), maximum))
 
         with torch.inference_mode():
             for step, batch in enumerate(progress):
-                if self.args.max_test_batches and step >= self.args.max_test_batches:
+                if max_batches and step >= max_batches:
                     break
                 images = batch["image"].to(self.device, non_blocking=True)
                 labels = batch["mask"].to(self.device, non_blocking=True)
                 names = [str(name) for name in batch["name"]]
                 outputs, candidates = self._forward_batch(
-                    images, names, warm_flag=True, candidate_bank=self.eval_candidate_bank
+                    images, names, warm_flag=True, candidate_bank=candidate_bank
                 )
                 coarse_metrics.update(outputs["coarse_logits"], labels)
                 refined_metrics.update(outputs["refined_logits"], labels)
                 coarse_segmentation_froc.update(outputs["coarse_logits"], labels)
                 refined_segmentation_froc.update(outputs["refined_logits"], labels)
                 total_gt_targets += self._count_gt_instances(labels)
+                transitions = _detection_transition_counts(
+                    outputs["coarse_logits"],
+                    outputs["refined_logits"],
+                    labels,
+                    self.args.center_distance,
+                )
+                for key, value in transitions.items():
+                    detection_transitions[key] += int(value)
 
                 if self.args.enable_ccrr:
                     if candidates is None:
@@ -1313,10 +1608,66 @@ class Trainer:
                     candidate_outputs = outputs["candidate_outputs"]
                     probs = candidate_outputs["class_probs"].detach().cpu().numpy()
                     train_labels = matching["training_labels"].detach().cpu().numpy()
+                    strict_labels = matching["strict_labels"].detach().cpu().numpy()
                     valid = train_labels != -1
                     if np.any(valid):
                         probabilities.append(probs[valid])
                         calibration_labels.append(train_labels[valid])
+
+                    batch_indices_tensor = matching["batch_indices"]
+                    candidate_masks_tensor = candidate_outputs[
+                        "candidate_masks"
+                    ].bool()
+                    coarse_candidate_probabilities = outputs[
+                        "coarse_logits"
+                    ].sigmoid()[batch_indices_tensor, 0]
+                    refined_candidate_probabilities = outputs[
+                        "refined_logits"
+                    ].sigmoid()[batch_indices_tensor, 0]
+                    masked_coarse = coarse_candidate_probabilities.masked_fill(
+                        ~candidate_masks_tensor, 0.0
+                    )
+                    masked_refined = refined_candidate_probabilities.masked_fill(
+                        ~candidate_masks_tensor, 0.0
+                    )
+                    coarse_peaks = masked_coarse.flatten(1).amax(dim=1)
+                    refined_peaks = masked_refined.flatten(1).amax(dim=1)
+                    areas = candidate_masks_tensor.flatten(1).sum(dim=1).clamp_min(1)
+                    coarse_means = masked_coarse.flatten(1).sum(dim=1) / areas
+                    deltas_tensor = candidate_outputs["deltas"].detach()
+                    gates_tensor = candidate_outputs.get("gates")
+                    if gates_tensor is None:
+                        gates_tensor = candidate_outputs.get("gate")
+                    if gates_tensor is None:
+                        gates_tensor = torch.zeros_like(deltas_tensor)
+                    delta_values.append(deltas_tensor.cpu().numpy())
+                    delta_labels.append(train_labels)
+
+                    batch_indices_np = batch_indices_tensor.detach().cpu().numpy()
+                    for index in range(len(train_labels)):
+                        image_name = names[int(batch_indices_np[index])]
+                        candidate_id = per_image_candidate_ids[image_name]
+                        per_image_candidate_ids[image_name] += 1
+                        candidate_records.append(
+                            {
+                                "image": image_name,
+                                "candidate_id": candidate_id,
+                                "strict_label": LABEL_NAMES[int(strict_labels[index])],
+                                "training_label": LABEL_NAMES[int(train_labels[index])],
+                                "raw_peak": float(coarse_peaks[index].item()),
+                                "raw_mean": float(coarse_means[index].item()),
+                                "target_prob": float(probs[index, TARGET_LABEL]),
+                                "clutter_prob": float(probs[index, CLUTTER_LABEL]),
+                                "delta": float(deltas_tensor[index].item()),
+                                "gate": float(gates_tensor[index].item()),
+                                "coarse_detected": bool(
+                                    coarse_peaks[index].item() >= 0.5
+                                ),
+                                "refined_detected": bool(
+                                    refined_peaks[index].item() >= 0.5
+                                ),
+                            }
+                        )
 
                     target_scores = candidate_outputs["target_scores"].detach().cpu().numpy()
                     raw_scores = self._candidate_score(candidates).detach().cpu().numpy()
@@ -1352,15 +1703,20 @@ class Trainer:
                 )
 
         if num_images == 0:
-            raise RuntimeError("no test images were evaluated")
+            raise RuntimeError(f"no {split} images were evaluated")
         coarse_summary = coarse_metrics.get(num_images)
         refined_summary = refined_metrics.get(num_images)
         metrics: dict[str, Any] = {
             "epoch": epoch,
             "num_images": num_images,
-            "split": self.split_summary,
+            "split": {
+                **self.split_summary,
+                "evaluated_split": split,
+                "used_for_model_selection": bool(select_weights),
+            },
             "coarse": coarse_summary,
             "refined": refined_summary,
+            "detection_transitions": dict(detection_transitions),
         }
         coarse_froc = coarse_segmentation_froc.get()
         refined_froc = refined_segmentation_froc.get()
@@ -1421,6 +1777,10 @@ class Trainer:
                     all_probabilities, all_labels
                 )
             else:
+                all_probabilities = np.empty(
+                    (0, self.args.ccrr_num_classes), dtype=np.float64
+                )
+                all_labels = np.empty((0,), dtype=np.int64)
                 calibration = {
                     "num_labeled_candidates": 0,
                     "ECE": float("nan"),
@@ -1523,9 +1883,21 @@ class Trainer:
             metrics["candidate"] = {
                 **calibration,
                 "calibration_scope": (
-                    "CCRR head labels; binary MVP excludes uncertain candidates"
+                    "all candidates; binary target-presence supervision"
                 ),
                 "paired_calibration": paired_calibration,
+                "classification": _binary_candidate_metrics(
+                    all_probabilities[:, :2], all_labels
+                ),
+                "delta_statistics": _delta_statistics(
+                    np.concatenate(delta_values, axis=0)
+                    if delta_values
+                    else np.empty((0,), dtype=np.float64),
+                    np.concatenate(delta_labels, axis=0)
+                    if delta_labels
+                    else np.empty((0,), dtype=np.int64),
+                    self.args.max_delta,
+                ),
                 "num_candidates": int(scores.size),
                 "num_gt_targets": int(total_gt_targets),
                 "FPPI_at_reliability_0.5": float(at_half["fppi"][0]),
@@ -1550,7 +1922,7 @@ class Trainer:
                 },
             }
 
-        if self.mode == "train":
+        if self.mode == "train" and select_weights:
             score_key = "refined" if self.args.enable_ccrr else "coarse"
             mean_iou = float(metrics[score_key]["mIoU"])
             detection_probability = float(metrics[score_key]["Pd"])
@@ -1583,9 +1955,25 @@ class Trainer:
                 "best_Pd_weight": "best_pd.pkl",
             }
 
+        if self.args.enable_ccrr:
+            diagnostics_dir = Path(self.save_folder) / "diagnostics"
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            records_path = diagnostics_dir / f"{split}_candidates_epoch_{epoch:04d}.jsonl"
+            records_path.write_text(
+                "".join(
+                    json.dumps(record, ensure_ascii=False) + "\n"
+                    for record in candidate_records
+                ),
+                encoding="utf-8",
+            )
+            metrics["candidate_records"] = {
+                "path": str(records_path),
+                "count": len(candidate_records),
+            }
+
         metrics = _jsonable(metrics)
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
-        if self.args.metrics_output:
+        if self.args.metrics_output and split == "test":
             output_path = Path(self.args.metrics_output)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(
@@ -1595,10 +1983,20 @@ class Trainer:
 
         if self.mode == "train":
             self.save_checkpoint(epoch, metrics)
-            with open(osp.join(self.save_folder, "metrics.jsonl"), "a", encoding="utf-8") as handle:
+            with open(
+                osp.join(self.save_folder, "metrics.jsonl"),
+                "a",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+        else:
+            with open(
+                osp.join(self.save_folder, "test_metrics.jsonl"),
+                "a",
+                encoding="utf-8",
+            ) as handle:
                 handle.write(json.dumps(metrics, ensure_ascii=False) + "\n")
         return metrics
-
 
 def main(default_mode: str | None = None) -> None:
     args = parse_args(default_mode)
@@ -1617,6 +2015,8 @@ def main(default_mode: str | None = None) -> None:
                 encoding="utf-8",
             ) as handle:
                 handle.write(json.dumps(training_record, ensure_ascii=False) + "\n")
+            if trainer.scheduler is not None:
+                trainer.scheduler.step()
             if should_run_scheduled_test(epoch, args.test_start_epoch):
                 trainer.test(epoch)
             else:

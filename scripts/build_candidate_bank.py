@@ -68,7 +68,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--splits",
         nargs="+",
-        choices=("train", "val", "test"),
+        choices=("train", "test"),
         default=("train", "test"),
         help="Deterministic dataset splits to export (default: train test).",
     )

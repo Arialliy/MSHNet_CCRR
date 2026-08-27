@@ -1,0 +1,53 @@
+project: MSHNet-CCRR
+stage: head_only
+version: v1_safe
+seed: 42
+
+candidate:
+  threshold: 0.2
+  training_label_mode: target_presence
+  hard_negative_reporting_threshold: 0.5
+  easy_negative_weight: 0.5
+  hard_negative_weight: 2.0
+  hardness_gamma: 2.0
+  min_area: 1
+  max_area: 1024
+
+model:
+  feature_channels: 16
+  num_scales: 4
+  roi_size: 7
+  hidden_dim: 64
+  context_scale: 3.0
+  min_context_size: 15
+  dropout: 0.3
+  rectifier: suppression_only
+  max_suppression: 1.5
+  gate_margin: 0.5
+  gate_temperature: 0.1
+  zero_effect_initialization: true
+
+loss:
+  lambda_refined: 0.5
+  lambda_candidate: 1.0
+  lambda_calibration: 0.05
+  lambda_preservation: 1.0
+  label_smoothing: 0.05
+  target_allowed_peak_drop: 0.01
+  clutter_peak_ceiling: 0.45
+
+training:
+  epochs: 1000
+  ccrr_lr: 0.0003
+  weight_decay: 0.001
+  scheduler: cosine
+  eta_min: 0.000001
+  use_online_candidates: true
+  use_train_augmentation: true
+  validation_split: null
+  test_start_epoch: 500
+  test_interval: 1
+  selection_metrics:
+    - mIoU
+    - Pd
+  checkpoint_schema: mshnet-ccrr-weight/v2-safe

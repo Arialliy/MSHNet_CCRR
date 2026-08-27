@@ -2,10 +2,17 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
 
-from main import CandidateBank, parse_args, should_run_scheduled_test
+from main import (
+    CandidateBank,
+    Trainer,
+    parse_args,
+    should_run_scheduled_test,
+)
 
 
 def _bank_args(tmp_path):
@@ -69,6 +76,50 @@ def test_requested_training_defaults_are_frozen(monkeypatch):
     assert args.hard_negative_threshold == 0.5
     assert args.candidate_threshold == 0.2
     assert args.froc_bins == 100
+
+
+def test_v1_safe_model_defaults_keep_requested_test_schedule(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+    args = parse_args()
+
+    assert args.hidden_dim == 64
+    assert args.max_delta == 1.5
+    assert args.ccrr_lr == pytest.approx(3e-4)
+    assert args.epochs == 1000
+    assert args.test_start_epoch == 500
+    assert not hasattr(args, "val_start_epoch")
+
+
+def test_v1_presence_labels_supervise_low_score_zero_overlap_candidate():
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = SimpleNamespace(
+        positive_iou=0.3,
+        hard_negative_threshold=0.5,
+        center_distance=3.0,
+        candidate_score="coarse_peak",
+        easy_negative_weight=0.5,
+        hard_negative_weight=2.0,
+        hardness_gamma=2.0,
+    )
+    masks = torch.zeros((2, 8, 8), dtype=torch.bool)
+    masks[0, 7, 7] = True
+    masks[1, 0, 0] = True
+    candidates = {
+        "masks": masks,
+        "batch_indices": torch.tensor([0, 0]),
+        "coarse_peak_scores": torch.tensor([0.9, 0.3]),
+    }
+    ground_truth = torch.zeros((1, 1, 8, 8))
+    ground_truth[0, 0, 7, 7] = 1
+
+    matching = trainer._label_candidates(candidates, ground_truth)
+
+    assert matching["strict_labels"].tolist() == [0, 2]
+    assert matching["training_labels"].tolist() == [0, 1]
+    assert not torch.any(matching["training_labels"] == -1)
+    assert matching["sample_weights"][1].item() == pytest.approx(
+        0.5 + 1.5 * 0.3**2
+    )
 
 
 def test_candidate_bank_requires_exact_img_idx_manifest_and_metadata(tmp_path):

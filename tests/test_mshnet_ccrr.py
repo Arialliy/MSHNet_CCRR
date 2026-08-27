@@ -65,6 +65,7 @@ def _assert_common_output_contract(outputs, number_of_candidates):
     assert candidates["clutter_scores"].shape == (number_of_candidates,)
     assert candidates["uncertain_scores"].shape == (number_of_candidates,)
     assert candidates["deltas"].shape == (number_of_candidates,)
+    assert candidates["gates"].shape == (number_of_candidates,)
     assert candidates["boxes"].shape == (number_of_candidates, 5)
     assert candidates["candidate_masks"].shape == (
         number_of_candidates,
@@ -112,10 +113,14 @@ def test_mshnet_explicit_candidates_forward_and_backward():
     candidate_union[0] = masks[0]
     candidate_union[1] = masks[1]
     assert torch.count_nonzero(correction[~candidate_union]) == 0
-    assert torch.count_nonzero(correction[candidate_union]) > 0
+    # Zero-initialized reliability logits are equal target/clutter evidence;
+    # the zero-baseline gate therefore preserves the detector exactly.
+    assert torch.count_nonzero(correction[candidate_union]) == 0
+    assert torch.equal(candidates["gates"], torch.zeros(2))
+    assert torch.equal(candidates["deltas"], torch.zeros(2))
 
     _backward_refined_output(model, images, outputs)
-    reliability_weight = model.ccrr.reliability_head.classifier[0].weight
+    reliability_weight = model.ccrr.reliability_head.classifier[-1].weight
     assert reliability_weight.grad is not None
     assert torch.isfinite(reliability_weight.grad).all()
     assert reliability_weight.grad.abs().sum() > 0
@@ -154,10 +159,36 @@ def test_mshnet_online_candidates_forward_and_backward():
     assert candidates["scores"].shape == (BATCH_SIZE,)
 
     _backward_refined_output(model, images, outputs)
-    reliability_weight = model.ccrr.reliability_head.classifier[0].weight
+    reliability_weight = model.ccrr.reliability_head.classifier[-1].weight
     assert reliability_weight.grad is not None
     assert torch.isfinite(reliability_weight.grad).all()
     assert reliability_weight.grad.abs().sum() > 0
+
+
+def test_mshnet_trained_clutter_head_can_only_suppress_candidates():
+    model = _make_model().eval()
+    with torch.no_grad():
+        final_classifier = model.ccrr.reliability_head.classifier[-1]
+        final_classifier.weight.zero_()
+        final_classifier.bias.copy_(torch.tensor([-5.0, 5.0]))
+    images = _make_input()
+    boxes, masks = _explicit_candidates()
+
+    outputs = model(
+        images,
+        warm_flag=True,
+        candidate_boxes=boxes,
+        candidate_masks=masks,
+        enable_ccrr=True,
+    )
+
+    candidates = outputs["candidate_outputs"]
+    assert torch.all(candidates["gates"] > 0.99)
+    assert torch.all(candidates["deltas"] < -1.4)
+    assert torch.all(outputs["refined_logits"] <= outputs["coarse_logits"])
+    correction = (outputs["refined_logits"] - outputs["coarse_logits"]).squeeze(1)
+    assert torch.count_nonzero(correction[0][~masks[0]]) == 0
+    assert torch.count_nonzero(correction[1][~masks[1]]) == 0
 
 
 @pytest.mark.parametrize("candidate_source", ["explicit", "online"])

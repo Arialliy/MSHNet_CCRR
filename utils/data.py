@@ -17,17 +17,22 @@ class IRSTD_Dataset(Data.Dataset):
         
         dataset_dir = args.dataset_dir
 
-        if mode not in ('train', 'val', 'test'):
+        if mode not in ('train', 'test'):
             raise ValueError('Unknown dataset mode: {}'.format(mode))
 
-        self.split = split or ('train' if mode == 'train' else 'test')
-        self.list_dir = self._find_split_file(dataset_dir, self.split)
+        # Data augmentation (``mode``) and manifest selection (``split``) are
+        # deliberately independent.  Only the official train/test protocol is
+        # accepted; there is no validation split in this experiment.
+        self.split = split or mode
+        if self.split not in ('train', 'test'):
+            raise ValueError(
+                'Unsupported dataset split: {}. Only official train/test '
+                'splits are allowed.'.format(self.split)
+            )
         self.imgs_dir = osp.join(dataset_dir, 'images')
         self.label_dir = osp.join(dataset_dir, 'masks')
-
-        self.names = []
-        with open(self.list_dir, 'r') as f:
-            self.names += [line.strip() for line in f.readlines() if line.strip()]
+        manifests = self._validate_data_contract(dataset_dir)
+        self.list_dir, self.names = manifests[self.split]
 
         self.mode = mode
         self.crop_size = args.crop_size
@@ -47,7 +52,7 @@ class IRSTD_Dataset(Data.Dataset):
 
         if self.mode == 'train':
             img, mask = self._sync_transform(img, mask)
-        elif self.mode in ('val', 'test'):
+        elif self.mode == 'test':
             img, mask = self._testval_sync_transform(img, mask)
         else:
             raise ValueError('Unknown dataset mode: {}'.format(self.mode))
@@ -65,34 +70,90 @@ class IRSTD_Dataset(Data.Dataset):
 
     @staticmethod
     def _find_split_file(dataset_dir, split):
-        if split == 'train':
-            candidates = [
-                osp.join(dataset_dir, 'trainval.txt'),
-                osp.join(dataset_dir, 'train.txt'),
-            ]
-            pattern = osp.join(dataset_dir, 'img_idx', 'train*.txt')
-        elif split in ('val', 'test'):
-            candidates = [osp.join(dataset_dir, 'test.txt')]
-            pattern = osp.join(dataset_dir, 'img_idx', 'test*.txt')
-        else:
-            raise ValueError('Unknown dataset split: {}'.format(split))
-
-        # Local experiments are keyed by the dataset-specific files under
-        # img_idx (for example train_IRSTD-1K.txt).  Keep the root-level names
-        # only as a compatibility fallback for an untouched upstream checkout.
-        matches = sorted(glob(pattern))
-        if matches:
-            return matches[0]
-
-        for path in candidates:
-            if osp.exists(path):
-                return path
-
-        raise FileNotFoundError(
-            'Cannot find split file for mode "{}" under {}. Expected one of {} or {}'.format(
-                split, dataset_dir, ', '.join(candidates), pattern
+        if split not in ('train', 'test'):
+            raise ValueError(
+                'Unsupported dataset split: {}. Only official train/test '
+                'splits are allowed.'.format(split)
             )
+        dataset_name = osp.basename(osp.normpath(dataset_dir))
+        path = osp.join(
+            dataset_dir,
+            'img_idx',
+            '{}_{}.txt'.format(split, dataset_name),
         )
+        if not osp.isfile(path):
+            raise FileNotFoundError(
+                'Missing official {} split manifest: {}'.format(split, path)
+            )
+        return path
+
+    @classmethod
+    def _validate_data_contract(cls, dataset_dir):
+        """Validate the immutable official train/test dataset protocol."""
+
+        manifests = {}
+        name_sets = {}
+        for split in ('train', 'test'):
+            path = cls._find_split_file(dataset_dir, split)
+            names = cls._read_split_names(path)
+            if not names:
+                raise ValueError('{} split manifest is empty: {}'.format(split, path))
+            duplicates = cls._duplicates(names)
+            if duplicates:
+                raise ValueError(
+                    'Duplicate image names in {} split manifest {}: {}'.format(
+                        split, path, ', '.join(sorted(duplicates)[:10])
+                    )
+                )
+            canonical_names = [cls._canonical_name(name) for name in names]
+            manifests[split] = (path, canonical_names)
+            name_sets[split] = set(canonical_names)
+
+        overlap = name_sets['train'] & name_sets['test']
+        if overlap:
+            raise ValueError(
+                'Dataset split leakage between official train and test: {}'.format(
+                    ', '.join(sorted(overlap)[:10])
+                )
+            )
+
+        images_dir = osp.join(dataset_dir, 'images')
+        masks_dir = osp.join(dataset_dir, 'masks')
+        for split in ('train', 'test'):
+            for name in manifests[split][1]:
+                try:
+                    cls._resolve_image_path(images_dir, name)
+                except FileNotFoundError as error:
+                    raise FileNotFoundError(
+                        'Missing image referenced by {} split: {}'.format(split, name)
+                    ) from error
+                try:
+                    cls._resolve_image_path(masks_dir, name)
+                except FileNotFoundError as error:
+                    raise FileNotFoundError(
+                        'Missing mask referenced by {} split: {}'.format(split, name)
+                    ) from error
+        return manifests
+
+    @staticmethod
+    def _read_split_names(path):
+        with open(path, 'r', encoding='utf-8') as handle:
+            return [line.strip() for line in handle if line.strip()]
+
+    @staticmethod
+    def _canonical_name(name):
+        return osp.splitext(name.strip().replace('\\', '/'))[0]
+
+    @classmethod
+    def _duplicates(cls, names):
+        seen = set()
+        duplicates = set()
+        for name in names:
+            canonical = cls._canonical_name(name)
+            if canonical in seen:
+                duplicates.add(canonical)
+            seen.add(canonical)
+        return duplicates
 
     @staticmethod
     def _resolve_image_path(root, name):
