@@ -90,6 +90,25 @@ def test_v1_safe_model_defaults_keep_requested_test_schedule(monkeypatch):
     assert not hasattr(args, "val_start_epoch")
 
 
+def test_resume_rejects_best_weight_without_optimizer_state(monkeypatch):
+    trainer = Trainer.__new__(Trainer)
+    trainer.device = torch.device("cpu")
+    trainer.scheduler = None
+    best_weight = {
+        "checkpoint_schema": "mshnet-ccrr-weight/v2-safe",
+        "net": {},
+        "epoch": 500,
+        "inference_config": {},
+        "evaluation_config": {},
+        "training_config": {},
+        "provenance": {},
+    }
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: best_weight)
+
+    with pytest.raises(RuntimeError, match="full checkpoint.pkl"):
+        trainer._resume_checkpoint("best_miou.pkl")
+
+
 def test_v1_presence_labels_supervise_low_score_zero_overlap_candidate():
     trainer = Trainer.__new__(Trainer)
     trainer.args = SimpleNamespace(

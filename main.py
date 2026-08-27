@@ -1187,6 +1187,57 @@ class Trainer:
         if not path:
             raise ValueError("--resume-path is required when --if-checkpoint true")
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        if not isinstance(checkpoint, Mapping):
+            raise RuntimeError(
+                "exact resume requires checkpoint.pkl; the supplied artifact "
+                "is only a model state dictionary"
+            )
+        required_fields = {
+            "checkpoint_schema",
+            "net",
+            "epoch",
+            "optimizer",
+            "scheduler",
+            "best_miou",
+            "best_pd",
+            "args",
+            "rng_state",
+            "inference_config",
+            "evaluation_config",
+            "training_config",
+            "provenance",
+        }
+        missing_fields = sorted(required_fields.difference(checkpoint))
+        if missing_fields:
+            raise RuntimeError(
+                "exact resume requires the full checkpoint.pkl; missing fields: "
+                + ", ".join(missing_fields)
+            )
+        if checkpoint.get("checkpoint_schema") != WEIGHT_SCHEMA_VERSION:
+            raise RuntimeError("exact resume checkpoint has an unsupported schema")
+        if not isinstance(checkpoint["net"], Mapping):
+            raise RuntimeError("exact resume checkpoint has an invalid net state")
+        if not isinstance(checkpoint["optimizer"], Mapping):
+            raise RuntimeError("exact resume checkpoint has an invalid optimizer state")
+        if self.scheduler is not None and not isinstance(
+            checkpoint["scheduler"], Mapping
+        ):
+            raise RuntimeError("exact resume checkpoint has no scheduler state")
+        if self.scheduler is None and checkpoint["scheduler"] is not None:
+            raise RuntimeError(
+                "exact resume checkpoint contains a scheduler, but the current run does not"
+            )
+        rng_state = checkpoint["rng_state"]
+        if not isinstance(rng_state, Mapping):
+            raise RuntimeError("exact resume checkpoint has an invalid RNG state")
+        missing_rng_fields = sorted(
+            {"python", "numpy", "torch", "cuda"}.difference(rng_state)
+        )
+        if missing_rng_fields:
+            raise RuntimeError(
+                "exact resume checkpoint has an incomplete RNG state; missing fields: "
+                + ", ".join(missing_rng_fields)
+            )
         state_dict = self._normalise_state_dict(checkpoint)
         if self.args.enable_ccrr and not any(
             key.startswith("ccrr.") for key in state_dict
@@ -1200,32 +1251,22 @@ class Trainer:
             validate_training=True,
         )
         self._state_model().load_state_dict(state_dict, strict=True)
-        if isinstance(checkpoint, dict) and "optimizer" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-        if (
-            isinstance(checkpoint, dict)
-            and self.scheduler is not None
-            and checkpoint.get("scheduler") is not None
-        ):
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        if self.scheduler is not None:
             self.scheduler.load_state_dict(checkpoint["scheduler"])
-        if isinstance(checkpoint, dict):
-            self.start_epoch = int(checkpoint.get("epoch", -1)) + 1
-            self.best_iou = float(
-                checkpoint.get("best_miou", checkpoint.get("iou", -1.0))
+        self.start_epoch = int(checkpoint["epoch"]) + 1
+        self.best_iou = float(checkpoint["best_miou"])
+        self.best_pd = float(checkpoint["best_pd"])
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        torch.set_rng_state(rng_state["torch"].cpu())
+        if torch.cuda.is_available() and rng_state["cuda"] is not None:
+            torch.cuda.set_rng_state_all(
+                [state.cpu() for state in rng_state["cuda"]]
             )
-            self.best_pd = float(checkpoint.get("best_pd", -1.0))
-            rng_state = checkpoint.get("rng_state")
-            if isinstance(rng_state, Mapping):
-                random.setstate(rng_state["python"])
-                np.random.set_state(rng_state["numpy"])
-                torch.set_rng_state(rng_state["torch"].cpu())
-                if torch.cuda.is_available() and rng_state.get("cuda") is not None:
-                    torch.cuda.set_rng_state_all(
-                        [state.cpu() for state in rng_state["cuda"]]
-                    )
-            provenance = checkpoint.get("provenance", {})
-            saved_baseline = provenance.get("baseline_weight_sha256")
-            self.baseline_weight_sha256 = str(saved_baseline) if saved_baseline else None
+        provenance = checkpoint["provenance"]
+        saved_baseline = provenance.get("baseline_weight_sha256")
+        self.baseline_weight_sha256 = str(saved_baseline) if saved_baseline else None
         self.parent_weight_sha256 = _file_sha256(path)
         self._validate_candidate_bank_ancestry()
         self.save_folder = osp.dirname(path) or self.args.save_dir
