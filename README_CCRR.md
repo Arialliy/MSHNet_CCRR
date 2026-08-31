@@ -217,7 +217,7 @@ Resume with the same architecture and candidate settings:
   --candidate-bank candidate_bank/IRSTD-1K/train/train_candidates.json \
   --test-candidate-bank candidate_bank/IRSTD-1K/test/test_candidates.json \
   --if-checkpoint true \
-  --resume-path PATH_TO_CHECKPOINT \
+  --resume-path PATH_TO_RUN/checkpoint.pkl \
   --epochs 1000 \
   --test-start-epoch 500
 ```
@@ -228,7 +228,7 @@ ECE, Brier, NLL, risk--coverage/AURC and FROC.
 
 ## Verification status
 
-- Full test suite: `59 passed`
+- Full test suite: `78 passed`
 - Full IRSTD-1K baseline regression: exact match to the stored baseline metrics
 - Baseline train/test entrypoints: exercised
 - CCRR explicit, online and empty-candidate forward/backward paths: exercised

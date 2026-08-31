@@ -44,6 +44,12 @@ Primary artifacts are:
 - `metrics.jsonl`;
 - `diagnostics/test_candidates_epoch_*.jsonl`.
 
+Exact training continuation must use `checkpoint.pkl` with the same model,
+evaluation and training configuration.  The checkpoint restores the model,
+optimizer, scheduler and random-number-generator states.  The test-selected
+`best_miou.pkl` and `best_pd.pkl` artifacts contain model weights for evaluation
+and are deliberately rejected as exact-resume inputs.
+
 Because model selection uses the test split by explicit project protocol,
 these weights and reported metrics must be described as test-selected. Do not
 proceed to `joint` unless refined Fa decreases while Pd remains stable and the

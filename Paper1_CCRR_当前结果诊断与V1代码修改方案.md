@@ -1,9 +1,16 @@
 # Paper 1：CCRR 当前结果诊断、方案修正与代码修改指南
 
-> **分析对象**：`https://github.com/Arialliy/MSHNet_CCRR` 当前 `main` 分支  
-> **分析日期**：2026-08-27  
-> **当前实验**：IRSTD-1K，CCRR `head_only`，Epoch 616/1000  
+> **分析对象**：`https://github.com/Arialliy/MSHNet_CCRR` 当前 `main` 分支
+>
+> **分析日期**：2026-08-27
+>
+> **当前实验**：IRSTD-1K，CCRR `head_only`，Epoch 616/1000
+>
 > **当前定位**：将本轮训练视为 **V0 诊断实验**，不要直接进入 `joint` 阶段
+>
+> **协议覆盖说明**：本文后续关于 validation split 或 early stopping 的建议均已被
+> [CCRR-V1 safe protocol](README_CCRR_V1.md) 覆盖；当前实现不创建验证集，按既定协议
+> 从 epoch 500 起评估测试集，并将 `best_miou.pkl`/`best_pd.pkl` 明确标记为 test-selected。
 
 ---
 

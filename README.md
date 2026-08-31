@@ -28,7 +28,7 @@ python main.py --dataset-dir DATASET_DIR --batch-size 4 --epochs 1000 --test-sta
 
 For example:
 ```
-python main.py --dataset-dir '/dataset/IRSTD-1k' --batch-size 4 --epochs 1000 --test-start-epoch 500 --lr 0.05 --mode 'train'
+python main.py --dataset-dir datasets/IRSTD-1K --batch-size 4 --epochs 1000 --test-start-epoch 500 --lr 0.05 --mode train
 ```
 
 This repo also provides separate entrypoints:
@@ -49,7 +49,7 @@ python3 -m venv .venv
 ## Testing
 You can test the model with the following command:
 ```
-python main.py --dataset-dir '/dataset/IRSTD-1k' --batch-size 4 --mode 'test' --weight-path '/weight/MSHNet_weight.tar'
+python main.py --dataset-dir datasets/IRSTD-1K --batch-size 4 --mode test --weight-path /path/to/MSHNet_weight.tar
 ```
 
 Or use the separate testing entrypoint:
@@ -57,15 +57,19 @@ Or use the separate testing entrypoint:
 .venv/bin/python test.py --dataset-dir datasets/IRSTD-1K --weight-path repro_runs/IRSTD-1K-baseline-YYYY-MM-DD-HH-MM-SS/weight.pkl --device cuda
 ```
 
-The dataset loader supports both the original `trainval.txt`/`test.txt` layout and the local `img_idx/train_*.txt`/`img_idx/test_*.txt` layout.
+The dataset loader requires the official `img_idx/train_<dataset>.txt` and
+`img_idx/test_<dataset>.txt` manifests; root-level `trainval.txt`/`test.txt`
+files are not used as fallbacks.
 
 ## CCRR extension
 
 This repository also contains the opt-in Candidate--Context Reliability
-Rectification extension.  Its frozen thresholds, baseline/diagnosis results,
-candidate-bank commands, training stages and verification status are documented
-in [README_CCRR.md](README_CCRR.md).  Baseline behavior remains the default;
-pass `--enable-ccrr` to activate the extension.
+Rectification extension.  New experiments should follow the
+[CCRR-V1 safe protocol](README_CCRR_V1.md), which uses online candidates, full
+candidate supervision, ring context and suppression-only rectification.  The
+[V0 execution guide](README_CCRR.md) is retained as a diagnostic record.
+Baseline behavior remains the default; pass `--enable-ccrr` to activate the
+extension.
 
 Datasets, checkpoints, candidate banks, predictions and run outputs are local
 artifacts and are intentionally excluded from version control.  Place or
