@@ -271,6 +271,280 @@ def generate_candidates(
     }
 
 
+def map_action_components_to_proposals(
+    action_masks: torch.Tensor,
+    action_batch_indices: torch.Tensor,
+    proposal_masks: torch.Tensor,
+    proposal_batch_indices: torch.Tensor,
+    *,
+    fallback_dilation: int = 1,
+) -> dict[str, torch.Tensor]:
+    """Map every exact output component to one feature proposal.
+
+    Mapping is restricted to the same image and maximizes overlap pixels;
+    ties retain proposal scan order.  An action without overlap receives a
+    deterministic 8-neighborhood dilation fallback.  A proposal may describe
+    multiple actions, but every action appears exactly once in the output.
+    """
+
+    if action_masks.ndim != 3 or proposal_masks.ndim != 3:
+        raise ValueError("action_masks and proposal_masks must have shape [N,H,W]")
+    if tuple(action_masks.shape[-2:]) != tuple(proposal_masks.shape[-2:]):
+        raise ValueError("action_masks and proposal_masks must have the same spatial shape")
+    if action_batch_indices.shape != (action_masks.shape[0],):
+        raise ValueError("action_batch_indices must have shape [N_action]")
+    if proposal_batch_indices.shape != (proposal_masks.shape[0],):
+        raise ValueError("proposal_batch_indices must have shape [N_proposal]")
+    if action_masks.device != proposal_masks.device:
+        raise ValueError("action_masks and proposal_masks must be on the same device")
+    if int(fallback_dilation) != fallback_dilation or fallback_dilation < 0:
+        raise ValueError("fallback_dilation must be a non-negative integer")
+
+    device = action_masks.device
+    action_masks = action_masks.bool()
+    proposal_masks = proposal_masks.bool()
+    action_batch_indices = action_batch_indices.to(device=device, dtype=torch.long)
+    proposal_batch_indices = proposal_batch_indices.to(device=device, dtype=torch.long)
+    selected_proposals = []
+    selected_ids = []
+    fallback_flags = []
+    overlap_pixels = []
+    mapping_ious = []
+    proposal_has_action_overlap = torch.zeros(
+        proposal_masks.shape[0], dtype=torch.bool, device=device
+    )
+
+    for action_mask, batch_index in zip(action_masks, action_batch_indices):
+        eligible_ids = torch.nonzero(
+            proposal_batch_indices == batch_index, as_tuple=False
+        ).flatten()
+        chosen_id = -1
+        chosen_overlap = 0
+        if eligible_ids.numel():
+            intersections = (
+                proposal_masks[eligible_ids] & action_mask.unsqueeze(0)
+            ).flatten(1).sum(dim=1)
+            proposal_has_action_overlap[eligible_ids] |= intersections > 0
+            best_position = int(torch.argmax(intersections).item())
+            chosen_overlap = int(intersections[best_position].item())
+            if chosen_overlap > 0:
+                chosen_id = int(eligible_ids[best_position].item())
+
+        if chosen_id >= 0:
+            proposal_mask = proposal_masks[chosen_id]
+            fallback = False
+        else:
+            if fallback_dilation:
+                kernel_size = 2 * fallback_dilation + 1
+                proposal_mask = F.max_pool2d(
+                    action_mask[None, None].float(),
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=fallback_dilation,
+                )[0, 0] > 0
+            else:
+                proposal_mask = action_mask.clone()
+            fallback = True
+            chosen_overlap = int(action_mask.sum().item())
+
+        intersection = int((proposal_mask & action_mask).sum().item())
+        union = int((proposal_mask | action_mask).sum().item())
+        selected_proposals.append(proposal_mask)
+        selected_ids.append(chosen_id)
+        fallback_flags.append(fallback)
+        overlap_pixels.append(chosen_overlap)
+        mapping_ious.append(intersection / union if union else 0.0)
+
+    height, width = action_masks.shape[-2:]
+    if selected_proposals:
+        selected_tensor = torch.stack(selected_proposals)
+    else:
+        selected_tensor = torch.empty((0, height, width), dtype=torch.bool, device=device)
+    return {
+        "proposal_masks": selected_tensor,
+        "proposal_component_ids": torch.tensor(
+            selected_ids, dtype=torch.long, device=device
+        ),
+        "proposal_is_fallback": torch.tensor(
+            fallback_flags, dtype=torch.bool, device=device
+        ),
+        "proposal_action_overlap_pixels": torch.tensor(
+            overlap_pixels, dtype=torch.long, device=device
+        ),
+        "proposal_to_action_iou": torch.tensor(
+            mapping_ious, dtype=torch.float32, device=device
+        ),
+        "raw_proposal_has_action_overlap": proposal_has_action_overlap,
+    }
+
+
+def generate_component_aligned_candidates(
+    coarse_logits: torch.Tensor,
+    multi_scale_logits: Sequence[torch.Tensor] | torch.Tensor,
+    proposal_threshold: float = 0.2,
+    output_threshold: float = 0.5,
+    min_area: int = 1,
+    max_area: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Create one action candidate per exact final-output component.
+
+    ``proposal_masks`` are low-threshold multi-scale regions used only for
+    feature/context encoding.  ``action_masks`` are the complete 8-connected
+    components of ``sigmoid(coarse_logits) > output_threshold`` and are the
+    only masks that may be labelled, suppressed, or counted for FPPI.
+
+    Area bounds apply only to feature proposals.  They never remove an action
+    component from the final 0.5 output partition.
+    """
+
+    if not 0.0 <= float(output_threshold) <= 1.0:
+        raise ValueError("output_threshold must be in [0,1]")
+    coarse = _as_binary_logits(coarse_logits, "coarse_logits")
+    batch_size, _, height, width = coarse.shape
+    raw_proposals = generate_candidates(
+        coarse_logits=coarse,
+        multi_scale_logits=multi_scale_logits,
+        threshold_low=proposal_threshold,
+        min_area=min_area,
+        max_area=max_area,
+    )
+
+    action_masks_list = []
+    action_batch_indices_list = []
+    action_local_ids = []
+    output_binary = coarse.sigmoid()[:, 0] > float(output_threshold)
+    for batch_index in range(batch_size):
+        for local_id, component in enumerate(
+            _component_arrays(output_binary[batch_index]), start=1
+        ):
+            action_masks_list.append(
+                torch.as_tensor(component, dtype=torch.bool, device=coarse.device)
+            )
+            action_batch_indices_list.append(batch_index)
+            action_local_ids.append(local_id)
+
+    if action_masks_list:
+        action_masks = torch.stack(action_masks_list)
+        batch_indices = torch.tensor(
+            action_batch_indices_list, dtype=torch.long, device=coarse.device
+        )
+    else:
+        action_masks = torch.empty(
+            (0, height, width), dtype=torch.bool, device=coarse.device
+        )
+        batch_indices = torch.empty((0,), dtype=torch.long, device=coarse.device)
+
+    mapping = map_action_components_to_proposals(
+        action_masks,
+        batch_indices,
+        raw_proposals["masks"],
+        raw_proposals["batch_indices"],
+        fallback_dilation=1,
+    )
+    proposal_masks = mapping["proposal_masks"]
+    proposal_boxes = masks_to_roi_boxes(
+        {"masks": proposal_masks, "batch_indices": batch_indices}
+    )
+    action_boxes = masks_to_roi_boxes(
+        {"masks": action_masks, "batch_indices": batch_indices}
+    )
+
+    effective_scales = _logits_sequence(multi_scale_logits)
+    if not effective_scales:
+        effective_scales = [coarse]
+    scale_features = extract_scale_features(
+        effective_scales,
+        {"masks": proposal_masks, "batch_indices": batch_indices},
+    )
+    scale_responses = scale_features[:, :-1]
+    scale_variance = scale_features[:, -1]
+
+    coarse_probability = coarse.sigmoid()[:, 0]
+    mean_probability = raw_proposals["mean_probability"][:, 0]
+    coarse_peak_scores = []
+    coarse_mean_scores = []
+    proposal_scores = []
+    proposal_peak_scores = []
+    action_areas = []
+    proposal_areas = []
+    for action_mask, proposal_mask, batch_index in zip(
+        action_masks, proposal_masks, batch_indices
+    ):
+        action_values = coarse_probability[batch_index][action_mask]
+        proposal_values = mean_probability[batch_index][proposal_mask]
+        coarse_peak_scores.append(action_values.amax())
+        coarse_mean_scores.append(action_values.mean())
+        proposal_scores.append(proposal_values.mean())
+        proposal_peak_scores.append(proposal_values.amax())
+        action_areas.append(int(action_mask.sum().item()))
+        proposal_areas.append(int(proposal_mask.sum().item()))
+
+    probability_dtype = coarse.dtype
+    if action_masks.shape[0]:
+        coarse_peak_tensor = torch.stack(coarse_peak_scores)
+        coarse_mean_tensor = torch.stack(coarse_mean_scores)
+        proposal_score_tensor = torch.stack(proposal_scores)
+        proposal_peak_tensor = torch.stack(proposal_peak_scores)
+    else:
+        coarse_peak_tensor = torch.empty((0,), dtype=probability_dtype, device=coarse.device)
+        coarse_mean_tensor = torch.empty((0,), dtype=probability_dtype, device=coarse.device)
+        proposal_score_tensor = torch.empty((0,), dtype=probability_dtype, device=coarse.device)
+        proposal_peak_tensor = torch.empty((0,), dtype=probability_dtype, device=coarse.device)
+
+    raw_counts = torch.bincount(
+        raw_proposals["batch_indices"], minlength=batch_size
+    )
+    inactive_counts = torch.bincount(
+        raw_proposals["batch_indices"][
+            ~mapping["raw_proposal_has_action_overlap"]
+        ],
+        minlength=batch_size,
+    )
+    number_of_actions = action_masks.shape[0]
+    return {
+        "boxes": proposal_boxes,
+        "proposal_boxes": proposal_boxes,
+        "action_boxes": action_boxes,
+        "proposal_masks": proposal_masks,
+        "action_masks": action_masks,
+        "batch_indices": batch_indices,
+        "action_component_ids": torch.arange(
+            number_of_actions, dtype=torch.long, device=coarse.device
+        ),
+        "action_component_local_ids": torch.tensor(
+            action_local_ids, dtype=torch.long, device=coarse.device
+        ),
+        "proposal_component_ids": mapping["proposal_component_ids"],
+        "proposal_is_fallback": mapping["proposal_is_fallback"],
+        "proposal_action_overlap_pixels": mapping[
+            "proposal_action_overlap_pixels"
+        ],
+        "proposal_to_action_iou": mapping["proposal_to_action_iou"],
+        "coarse_peak_scores": coarse_peak_tensor,
+        "coarse_mean_scores": coarse_mean_tensor,
+        "proposal_scores": proposal_score_tensor,
+        "proposal_peak_scores": proposal_peak_tensor,
+        "action_areas": torch.tensor(
+            action_areas, dtype=torch.long, device=coarse.device
+        ),
+        "proposal_areas": torch.tensor(
+            proposal_areas, dtype=torch.long, device=coarse.device
+        ),
+        "scale_responses": scale_responses,
+        "scale_variance": scale_variance,
+        "mean_probability": raw_proposals["mean_probability"],
+        "scale_variance_map": raw_proposals["scale_variance_map"],
+        "num_raw_proposals_per_image": raw_counts,
+        "num_inactive_raw_proposals_per_image": inactive_counts,
+        "raw_proposal_masks": raw_proposals["masks"],
+        "raw_proposal_boxes": raw_proposals["boxes"],
+        "raw_proposal_batch_indices": raw_proposals["batch_indices"],
+        "raw_proposal_has_action_overlap": mapping[
+            "raw_proposal_has_action_overlap"
+        ],
+    }
+
+
 def generate_recovery_candidates(
     coarse_logits: torch.Tensor,
     multi_scale_logits: Sequence[torch.Tensor] | torch.Tensor,
@@ -729,8 +1003,10 @@ __all__ = [
     "CLUTTER_LABEL",
     "UNCERTAIN_LABEL",
     "LABEL_NAMES",
+    "generate_component_aligned_candidates",
     "generate_candidates",
     "generate_recovery_candidates",
+    "map_action_components_to_proposals",
     "match_candidates_to_gt",
     "masks_to_roi_boxes",
     "expand_boxes",

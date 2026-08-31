@@ -10,6 +10,7 @@ from utils.candidate import (
     UNCERTAIN_LABEL,
     expand_boxes,
     extract_scale_features,
+    generate_component_aligned_candidates,
     generate_candidates,
     generate_recovery_candidates,
     masks_to_roi_boxes,
@@ -61,6 +62,68 @@ def test_generate_candidates_has_shape_stable_empty_output():
     assert result["batch_indices"].shape == (0,)
     assert result["scale_responses"].shape == (0, 1)
     assert result["scale_variance"].shape == (0,)
+
+
+def test_component_aligned_candidates_partition_exact_output_components():
+    coarse_support = torch.zeros((1, 1, 7, 7), dtype=torch.bool)
+    coarse_support[0, 0, 2, 1] = True
+    coarse_support[0, 0, 2, 5] = True
+    proposal_support = torch.zeros_like(coarse_support)
+    proposal_support[0, 0, 2, 1:6] = True
+
+    result = generate_component_aligned_candidates(
+        _binary_logits(coarse_support),
+        [_binary_logits(proposal_support)],
+        proposal_threshold=0.2,
+        output_threshold=0.5,
+        min_area=1,
+        max_area=None,
+    )
+
+    assert result["action_component_ids"].tolist() == [0, 1]
+    assert result["action_component_local_ids"].tolist() == [1, 2]
+    assert result["proposal_component_ids"].tolist() == [0, 0]
+    assert result["proposal_is_fallback"].tolist() == [False, False]
+    assert torch.equal(result["action_masks"].any(dim=0), coarse_support[0, 0])
+    assert not torch.any(result["action_masks"][0] & result["action_masks"][1])
+    assert torch.equal(result["proposal_masks"][0], result["proposal_masks"][1])
+    assert result["action_areas"].tolist() == [1, 1]
+    assert result["proposal_areas"].tolist() == [5, 5]
+
+
+def test_component_aligned_candidate_fallback_preserves_filtered_action():
+    coarse_support = torch.zeros((1, 1, 5, 5), dtype=torch.bool)
+    coarse_support[0, 0, 0, 0] = True
+    proposal_support = torch.ones_like(coarse_support)
+
+    result = generate_component_aligned_candidates(
+        _binary_logits(coarse_support),
+        [_binary_logits(proposal_support)],
+        proposal_threshold=0.2,
+        output_threshold=0.5,
+        min_area=1,
+        max_area=10,
+    )
+
+    assert result["action_masks"].shape == (1, 5, 5)
+    assert result["action_masks"][0, 0, 0]
+    assert result["proposal_component_ids"].tolist() == [-1]
+    assert result["proposal_is_fallback"].tolist() == [True]
+    assert result["proposal_areas"].tolist() == [4]
+    assert result["num_raw_proposals_per_image"].tolist() == [0]
+
+
+def test_component_aligned_candidates_use_strict_half_probability_threshold():
+    coarse = torch.full((1, 1, 4, 4), -20.0)
+    coarse[0, 0, 1, 1] = 0.0  # sigmoid == 0.5, therefore not an action.
+    proposal = torch.full_like(coarse, 20.0)
+
+    result = generate_component_aligned_candidates(coarse, [proposal])
+
+    assert result["action_masks"].shape == (0, 4, 4)
+    assert result["proposal_masks"].shape == (0, 4, 4)
+    assert result["raw_proposal_masks"].shape == (1, 4, 4)
+    assert result["num_inactive_raw_proposals_per_image"].tolist() == [1]
 
 
 def test_generate_recovery_candidates_uses_local_max_and_strict_score_band():

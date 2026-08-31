@@ -14,9 +14,12 @@ from typing import Any
 import hashlib
 
 import numpy as np
-from skimage.measure import label as connected_components
 
-from utils.detection_metric import maximum_centroid_pairs
+from utils.detection_metric import (
+    component_detection_summary,
+    extract_components,
+    maximum_centroid_pairs,
+)
 
 
 def file_sha256(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
@@ -32,11 +35,7 @@ def file_sha256(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
 def component_masks(binary_mask: Any) -> list[np.ndarray]:
     """Return deterministic 8-connected component masks for one image."""
 
-    array = np.asarray(binary_mask, dtype=bool)
-    if array.ndim != 2:
-        raise ValueError("binary_mask must have shape [H,W]")
-    labels = connected_components(array, connectivity=2)
-    return [labels == index for index in range(1, int(labels.max()) + 1)]
+    return list(extract_components(binary_mask).masks)
 
 
 def component_centroid(mask: np.ndarray) -> np.ndarray:
@@ -79,27 +78,11 @@ def detection_snapshot(
         raise ValueError("prediction_mask and target_mask must have shape [H,W]")
     if prediction.shape != target.shape:
         raise ValueError("prediction_mask and target_mask must have identical shapes")
-    gt_components = component_masks(target)
-    prediction_components = component_masks(prediction)
-    assignment = maximum_centroid_assignment(
-        gt_components, prediction_components, center_distance
+    return component_detection_summary(
+        prediction,
+        target,
+        center_distance=center_distance,
     )
-    matched_predictions = set(assignment.values())
-    false_positive_indices = [
-        index
-        for index in range(len(prediction_components))
-        if index not in matched_predictions
-    ]
-    missed_gt_indices = [
-        index for index in range(len(gt_components)) if index not in assignment
-    ]
-    return {
-        "gt_components": gt_components,
-        "prediction_components": prediction_components,
-        "gt_to_prediction": assignment,
-        "false_positive_indices": false_positive_indices,
-        "missed_gt_indices": missed_gt_indices,
-    }
 
 
 @dataclass
