@@ -1,5 +1,10 @@
 # CCRR-V1 safe protocol
 
+> **Status:** This document records the V1 safe baseline. New threshold-aware
+> experiments use `configs/ccrr_v1_threshold_aware.yaml` and
+> `scripts/run_ccrr_v1_threshold_aware.sh`; the suppression-only V1 safety
+> invariant is preserved.
+
 CCRR-V1 treats the previous 1000-epoch head-only run as a V0 diagnostic. Do
 not initialize joint training from a V0 best weight.
 
