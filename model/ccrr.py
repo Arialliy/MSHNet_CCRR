@@ -17,6 +17,7 @@ forms are normalised to the flat representation in ``candidate_outputs``.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import Any
 
 import torch
@@ -583,6 +584,266 @@ class ReliabilityHead(nn.Module):
         return self.classifier(relation_features)
 
 
+class SelectiveReliabilityHead(nn.Module):
+    """Predict clutter probability and target-presence quality separately.
+
+    The two final layers are zero-initialised by default.  Consequently both
+    probabilities start at ``0.5`` and, together with
+    :class:`SelectiveRiskGate`, the SCA branch starts as an exact Keep/no-op
+    plugin.  Keeping the two predictions separate is important: looking like
+    clutter is not the same question as being safe to remove.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.3,
+        zero_effect_initialization: bool = True,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("input_dim and hidden_dim must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must lie in [0,1)")
+
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.shared = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+        )
+        self.clutter_head = nn.Linear(hidden_dim, 1)
+        self.quality_head = nn.Linear(hidden_dim, 1)
+        if zero_effect_initialization:
+            nn.init.zeros_(self.clutter_head.weight)
+            nn.init.zeros_(self.clutter_head.bias)
+            nn.init.zeros_(self.quality_head.weight)
+            nn.init.zeros_(self.quality_head.bias)
+
+    def forward(self, relation_features: Tensor) -> dict[str, Tensor]:
+        if relation_features.ndim != 2 or relation_features.shape[1] != self.input_dim:
+            raise ValueError(
+                f"relation_features must have shape [N,{self.input_dim}]"
+            )
+        if not torch.isfinite(relation_features).all():
+            raise ValueError("relation_features contain NaN or infinite values")
+
+        shared_feature = self.shared(relation_features)
+        clutter_logits = self.clutter_head(shared_feature).squeeze(1)
+        target_quality_logits = self.quality_head(shared_feature).squeeze(1)
+        clutter_probability = clutter_logits.sigmoid()
+        target_quality = target_quality_logits.sigmoid()
+        for name, value in (
+            ("shared_feature", shared_feature),
+            ("clutter_logits", clutter_logits),
+            ("target_quality_logits", target_quality_logits),
+            ("clutter_probability", clutter_probability),
+            ("target_quality", target_quality),
+        ):
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{name} contains NaN or infinite values")
+        return {
+            "clutter_logits": clutter_logits,
+            "target_quality_logits": target_quality_logits,
+            "clutter_probability": clutter_probability,
+            "target_quality": target_quality,
+            "shared_feature": shared_feature,
+        }
+
+
+class ActionMaskEncoder(nn.Module):
+    """Encode exact output-component shape and coarse confidence.
+
+    ``action_masks`` are sampled only here (and by the executor below).  They
+    are deliberately not used by :class:`CandidateContextEncoder`, whose
+    context and scale features are defined by the lower-threshold proposal
+    masks instead.
+    """
+
+    def __init__(
+        self,
+        roi_size: int | tuple[int, int] = 7,
+        hidden_dim: int = 16,
+    ) -> None:
+        super().__init__()
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
+        if isinstance(roi_size, int):
+            if roi_size <= 0:
+                raise ValueError("roi_size must be positive")
+        elif (
+            not isinstance(roi_size, tuple)
+            or len(roi_size) != 2
+            or any(size <= 0 for size in roi_size)
+        ):
+            raise ValueError("roi_size must be a positive int or a positive (h,w) tuple")
+
+        self.roi_size = roi_size
+        self.hidden_dim = int(hidden_dim)
+        self.output_dim = int(hidden_dim)
+        self.mask_encoder = nn.Sequential(
+            nn.Conv2d(2, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+        )
+
+    @staticmethod
+    def boxes_from_masks(
+        action_masks: Tensor,
+        batch_indices: Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Return half-open component boxes without merging candidates."""
+
+        if action_masks.ndim != 3:
+            raise ValueError("action_masks must have shape [N,H,W]")
+        num_candidates = action_masks.shape[0]
+        if batch_indices.ndim != 1 or batch_indices.shape[0] != num_candidates:
+            raise ValueError("batch_indices must have shape [N]")
+        if num_candidates == 0:
+            return torch.empty(
+                (0, 5), device=action_masks.device, dtype=dtype
+            )
+
+        boxes = []
+        for index in range(num_candidates):
+            positions = torch.nonzero(action_masks[index], as_tuple=False)
+            if positions.numel() == 0:
+                raise ValueError("every action mask must contain at least one pixel")
+            y1, x1 = positions.amin(dim=0)
+            y2, x2 = positions.amax(dim=0) + 1
+            boxes.append(
+                torch.stack(
+                    (
+                        batch_indices[index],
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                    )
+                )
+            )
+        return torch.stack(boxes).to(device=action_masks.device, dtype=dtype)
+
+    def forward(
+        self,
+        coarse_logits: Tensor,
+        action_masks: Tensor,
+        action_boxes: Tensor | None = None,
+        batch_indices: Tensor | None = None,
+    ) -> Tensor:
+        if coarse_logits.ndim != 4 or coarse_logits.shape[1] != 1:
+            raise ValueError("coarse_logits must have shape [B,1,H,W]")
+        if not torch.is_floating_point(coarse_logits):
+            raise TypeError("coarse_logits must be floating point")
+        if not torch.isfinite(coarse_logits).all():
+            raise ValueError("coarse_logits contain NaN or infinite values")
+
+        if action_masks.ndim == 2:
+            action_masks = action_masks.unsqueeze(0)
+        if action_masks.ndim == 4 and action_masks.shape[1] == 1:
+            action_masks = action_masks[:, 0]
+        if action_masks.ndim != 3:
+            raise ValueError("action_masks must have shape [N,H,W]")
+        if torch.is_floating_point(action_masks) and not torch.isfinite(action_masks).all():
+            raise ValueError("action_masks contain NaN or infinite values")
+        if tuple(action_masks.shape[-2:]) != tuple(coarse_logits.shape[-2:]):
+            action_masks = F.interpolate(
+                action_masks.unsqueeze(1).float(),
+                size=coarse_logits.shape[-2:],
+                mode="nearest",
+            )[:, 0]
+        masks = (action_masks > 0.5).to(device=coarse_logits.device)
+        num_candidates = masks.shape[0]
+
+        if batch_indices is None:
+            if coarse_logits.shape[0] != 1 and num_candidates:
+                raise ValueError(
+                    "batch_indices are required for a multi-image coarse batch"
+                )
+            batch_indices = torch.zeros(
+                num_candidates, device=coarse_logits.device, dtype=torch.long
+            )
+        else:
+            batch_indices = batch_indices.to(
+                device=coarse_logits.device, dtype=torch.long
+            )
+        if batch_indices.ndim != 1 or batch_indices.shape[0] != num_candidates:
+            raise ValueError("batch_indices must have shape [N]")
+        if num_candidates and (
+            (batch_indices < 0).any()
+            or (batch_indices >= coarse_logits.shape[0]).any()
+        ):
+            raise ValueError("batch_indices contain an index outside coarse_logits")
+        if num_candidates == 0:
+            return coarse_logits.new_empty((0, self.output_dim))
+
+        if action_boxes is None:
+            boxes = self.boxes_from_masks(
+                masks,
+                batch_indices,
+                dtype=coarse_logits.dtype,
+            )
+        else:
+            boxes = _normalise_boxes(
+                action_boxes,
+                batch_size=coarse_logits.shape[0],
+                device=coarse_logits.device,
+                dtype=coarse_logits.dtype,
+            )
+            if boxes.shape[0] != num_candidates:
+                raise ValueError(
+                    "action box count must match the number of action masks"
+                )
+            boxes = _sanitize_boxes(
+                boxes,
+                tuple(coarse_logits.shape[-2:]),
+                coarse_logits.shape[0],
+            )
+            if not torch.equal(boxes[:, 0].long(), batch_indices):
+                raise ValueError(
+                    "action box batch indices must match batch_indices"
+                )
+
+        independent_mask_boxes = boxes.clone()
+        independent_mask_boxes[:, 0] = torch.arange(
+            num_candidates,
+            device=boxes.device,
+            dtype=boxes.dtype,
+        )
+        action_mask_roi = roi_align(
+            masks.to(dtype=coarse_logits.dtype).unsqueeze(1),
+            independent_mask_boxes,
+            output_size=self.roi_size,
+            spatial_scale=1.0,
+            sampling_ratio=-1,
+            aligned=True,
+        ).clamp(0.0, 1.0)
+        coarse_probability_roi = roi_align(
+            coarse_logits.sigmoid(),
+            boxes,
+            output_size=self.roi_size,
+            spatial_scale=1.0,
+            sampling_ratio=-1,
+            aligned=True,
+        ).clamp(0.0, 1.0)
+        encoded = self.mask_encoder(
+            torch.cat((action_mask_roi, coarse_probability_roi), dim=1)
+        )
+        if encoded.shape != (num_candidates, self.output_dim):
+            raise RuntimeError("ActionMaskEncoder produced an unexpected output shape")
+        if not torch.isfinite(encoded).all():
+            raise ValueError("action mask features contain NaN or infinite values")
+        return encoded
+
+
 class SafeClutterSuppressor(nn.Module):
     """Apply a bounded, confidence-gated, non-positive candidate residual.
 
@@ -877,6 +1138,259 @@ class ThresholdAwareClutterSuppressor(nn.Module):
         }
 
 
+class SelectiveRiskGate(nn.Module):
+    """Turn clutter and target-quality estimates into a selective action.
+
+    Evaluation uses the hard risk/veto rule from the SCA design.  Training
+    uses a differentiable risk gate, normalised so that the zero-initialised
+    head (``p_clutter == q_target == 0.5``) produces an *exact* zero action.
+    """
+
+    def __init__(
+        self,
+        risk_threshold: float = 2.0,
+        quality_veto_threshold: float = 0.5,
+        risk_alpha: float = 1.0,
+        temperature: float = 0.05,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if not math.isfinite(risk_threshold):
+            raise ValueError("risk_threshold must be finite")
+        if not 0.0 <= quality_veto_threshold <= 1.0:
+            raise ValueError("quality_veto_threshold must lie in [0,1]")
+        if not math.isfinite(risk_alpha) or risk_alpha < 0:
+            raise ValueError("risk_alpha must be non-negative and finite")
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be positive and finite")
+        if not 0.0 < eps < 0.5:
+            raise ValueError("eps must lie in (0,0.5)")
+        self.risk_threshold = float(risk_threshold)
+        self.quality_veto_threshold = float(quality_veto_threshold)
+        self.risk_alpha = float(risk_alpha)
+        self.temperature = float(temperature)
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        clutter_probability: Tensor,
+        target_quality: Tensor,
+    ) -> dict[str, Tensor]:
+        if clutter_probability.ndim != 1:
+            raise ValueError("clutter_probability must have shape [N]")
+        if target_quality.shape != clutter_probability.shape:
+            raise ValueError("target_quality must have the same shape as clutter_probability")
+        if not torch.is_floating_point(clutter_probability) or not torch.is_floating_point(
+            target_quality
+        ):
+            raise TypeError("clutter_probability and target_quality must be floating point")
+        if not torch.isfinite(clutter_probability).all():
+            raise ValueError("clutter_probability contains NaN or infinite values")
+        if not torch.isfinite(target_quality).all():
+            raise ValueError("target_quality contains NaN or infinite values")
+        if (
+            (clutter_probability < 0).any()
+            or (clutter_probability > 1).any()
+            or (target_quality < 0).any()
+            or (target_quality > 1).any()
+        ):
+            raise ValueError("probability inputs must lie in [0,1]")
+
+        clutter_probability = clutter_probability.clamp(self.eps, 1.0 - self.eps)
+        target_quality = target_quality.clamp(self.eps, 1.0 - self.eps)
+        clutter_logit = torch.logit(clutter_probability)
+        quality_logit = torch.logit(target_quality)
+        risk_score = clutter_logit - self.risk_alpha * quality_logit
+
+        raw_soft_action = torch.sigmoid(
+            (risk_score - self.risk_threshold) / self.temperature
+        )
+        # Equal evidence is the exact zero-effect state of the selective
+        # heads.  Removing its logistic tail retains useful gradients at the
+        # origin while preventing an accidental training-time modification.
+        zero_risk_action = torch.sigmoid(
+            risk_score.new_tensor(-self.risk_threshold / self.temperature)
+        )
+        soft_action = (
+            (raw_soft_action - zero_risk_action)
+            / (1.0 - zero_risk_action).clamp_min(self.eps)
+        ).clamp(0.0, 1.0)
+        quality_veto = (
+            target_quality <= self.quality_veto_threshold
+        ).to(dtype=soft_action.dtype)
+
+        if self.training:
+            gate = soft_action * quality_veto
+        else:
+            gate = (
+                (risk_score >= self.risk_threshold)
+                & (target_quality <= self.quality_veto_threshold)
+            ).to(dtype=soft_action.dtype)
+        for name, value in (
+            ("gate", gate),
+            ("risk_score", risk_score),
+            ("quality_veto", quality_veto),
+            ("soft_action", soft_action),
+        ):
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{name} contains NaN or infinite values")
+        return {
+            "gate": gate,
+            "risk_score": risk_score,
+            "quality_veto": quality_veto,
+            "soft_action": soft_action,
+            "clutter_logit": clutter_logit,
+            "quality_logit": quality_logit,
+        }
+
+
+class ComponentAlignedSuppressor(nn.Module):
+    """Execute a supplied gate on exact 0.5-output components.
+
+    This class contains no classifier threshold.  Selection belongs solely to
+    :class:`SelectiveRiskGate`; this executor only moves the currently
+    positive support of each selected component below ``remove_threshold``.
+    """
+
+    def __init__(
+        self,
+        remove_threshold: float = 0.45,
+        output_threshold: float = 0.5,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if not 0.0 < remove_threshold < output_threshold:
+            raise ValueError("remove_threshold must lie in (0,output_threshold)")
+        if not 0.0 < output_threshold < 1.0:
+            raise ValueError("output_threshold must lie in (0,1)")
+        if not 0.0 < eps < 0.5:
+            raise ValueError("eps must lie in (0,0.5)")
+        self.remove_threshold = float(remove_threshold)
+        self.output_threshold = float(output_threshold)
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        coarse_logits: Tensor,
+        gates: Tensor,
+        action_masks: Tensor,
+        batch_indices: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        if coarse_logits.ndim != 4 or coarse_logits.shape[1] != 1:
+            raise ValueError("coarse_logits must have shape [B,1,H,W]")
+        if not torch.is_floating_point(coarse_logits):
+            raise TypeError("coarse_logits must be floating point")
+        if not torch.isfinite(coarse_logits).all():
+            raise ValueError("coarse_logits contain NaN or infinite values")
+        if action_masks.ndim == 2:
+            action_masks = action_masks.unsqueeze(0)
+        if action_masks.ndim == 4 and action_masks.shape[1] == 1:
+            action_masks = action_masks[:, 0]
+        if action_masks.ndim != 3:
+            raise ValueError("action_masks must have shape [N,H,W]")
+        if torch.is_floating_point(action_masks) and not torch.isfinite(action_masks).all():
+            raise ValueError("action_masks contain NaN or infinite values")
+
+        num_candidates = action_masks.shape[0]
+        if gates.ndim != 1 or gates.shape[0] != num_candidates:
+            raise ValueError("gates must have shape [N]")
+        if not torch.is_floating_point(gates):
+            raise TypeError("gates must be floating point")
+        if not torch.isfinite(gates).all():
+            raise ValueError("gates contain NaN or infinite values")
+        if (gates < 0).any() or (gates > 1).any():
+            raise ValueError("gates must lie in [0,1]")
+
+        if batch_indices is None:
+            if coarse_logits.shape[0] != 1 and num_candidates:
+                raise ValueError("batch_indices are required for a multi-image batch")
+            batch_indices = torch.zeros(
+                num_candidates, device=coarse_logits.device, dtype=torch.long
+            )
+        else:
+            batch_indices = batch_indices.to(
+                device=coarse_logits.device, dtype=torch.long
+            )
+        if batch_indices.ndim != 1 or batch_indices.shape[0] != num_candidates:
+            raise ValueError("batch_indices must have shape [N]")
+        if num_candidates and (
+            (batch_indices < 0).any()
+            or (batch_indices >= coarse_logits.shape[0]).any()
+        ):
+            raise ValueError("batch_indices contain an index outside coarse_logits")
+        if num_candidates == 0:
+            empty = coarse_logits.new_empty((0,))
+            return {
+                "refined_logits": coarse_logits,
+                "deltas": empty,
+                "gates": gates.to(
+                    device=coarse_logits.device, dtype=coarse_logits.dtype
+                ),
+                "required_deltas": empty,
+                "unclipped_required_deltas": empty,
+                "peak_logits": empty,
+                "active_support": torch.zeros(
+                    (0, *coarse_logits.shape[-2:]),
+                    device=coarse_logits.device,
+                    dtype=torch.bool,
+                ),
+            }
+
+        if tuple(action_masks.shape[-2:]) != tuple(coarse_logits.shape[-2:]):
+            action_masks = F.interpolate(
+                action_masks.unsqueeze(1).float(),
+                size=coarse_logits.shape[-2:],
+                mode="nearest",
+            )[:, 0]
+        masks = (action_masks > 0.5).to(device=coarse_logits.device)
+        if not masks.flatten(1).any(dim=1).all():
+            raise ValueError("every action mask must contain at least one pixel")
+        gates = gates.to(device=coarse_logits.device, dtype=coarse_logits.dtype)
+
+        candidate_logits = coarse_logits[batch_indices, 0]
+        negative_infinity = torch.full_like(candidate_logits, float("-inf"))
+        peak_logits = torch.where(
+            masks, candidate_logits, negative_infinity
+        ).flatten(1).amax(dim=1)
+        remove_logit = torch.logit(
+            peak_logits.new_tensor(self.remove_threshold), eps=self.eps
+        )
+        required_deltas = (remove_logit - peak_logits).clamp(max=0.0)
+        deltas = gates * required_deltas
+
+        output_logit = torch.logit(
+            coarse_logits.new_tensor(self.output_threshold), eps=self.eps
+        )
+        active_support = masks & (candidate_logits.detach() > output_logit)
+        per_candidate_correction = (
+            active_support.to(dtype=coarse_logits.dtype) * deltas[:, None, None]
+        )
+        correction = coarse_logits.new_zeros(
+            (coarse_logits.shape[0], coarse_logits.shape[2], coarse_logits.shape[3])
+        )
+        correction = correction.index_add(
+            0, batch_indices, per_candidate_correction
+        )
+        refined_logits = coarse_logits + correction.unsqueeze(1)
+        for name, value in (
+            ("peak_logits", peak_logits),
+            ("required_deltas", required_deltas),
+            ("deltas", deltas),
+            ("refined_logits", refined_logits),
+        ):
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{name} contains NaN or infinite values")
+        return {
+            "refined_logits": refined_logits,
+            "deltas": deltas,
+            "gates": gates,
+            "required_deltas": required_deltas,
+            "unclipped_required_deltas": required_deltas,
+            "peak_logits": peak_logits,
+            "active_support": active_support,
+        }
+
+
 class InstanceLogitRectifier(SafeClutterSuppressor):
     """Backward-compatible name/call form for the V1 safe suppressor.
 
@@ -1088,11 +1602,395 @@ class CCRRModule(nn.Module):
         return refined_logits, candidate_outputs
 
 
+class SCACRRModule(nn.Module):
+    """Selective Component-Aligned CCRR.
+
+    The two mask roles are intentionally disjoint:
+
+    * ``proposal_masks`` define core/ring and multi-scale encoder features;
+    * ``action_masks`` define mask-quality features and are the only pixels
+      the suppressor may modify.
+
+    One proposal/action pair must be supplied for every final output
+    component.  ``candidate_metadata`` is forwarded for auditing but never
+    participates in the prediction, which keeps the model contract explicit.
+    """
+
+    def __init__(
+        self,
+        feature_channels: int,
+        num_scales: int = 4,
+        roi_size: int | tuple[int, int] = 7,
+        hidden_dim: int = 64,
+        context_scale: float = 3.0,
+        min_context_size: float = 15.0,
+        dropout: float = 0.3,
+        risk_threshold: float = 2.0,
+        quality_veto_threshold: float = 0.5,
+        risk_alpha: float = 1.0,
+        action_temperature: float = 0.05,
+        remove_threshold: float = 0.45,
+        output_threshold: float = 0.5,
+        mask_hidden_dim: int = 16,
+        eps: float = 1e-6,
+        zero_effect_initialization: bool = True,
+    ) -> None:
+        super().__init__()
+        self.num_scales = int(num_scales)
+        self.num_classes = 2
+        self.output_threshold = float(output_threshold)
+        self.encoder = CandidateContextEncoder(
+            feature_channels=feature_channels,
+            num_scales=num_scales,
+            roi_size=roi_size,
+            hidden_dim=hidden_dim,
+            context_scale=context_scale,
+            min_context_size=min_context_size,
+        )
+        self.mask_encoder = ActionMaskEncoder(
+            roi_size=roi_size,
+            hidden_dim=mask_hidden_dim,
+        )
+        self.geometry_dim = 8
+        self.reliability_head = SelectiveReliabilityHead(
+            input_dim=(
+                self.encoder.output_dim
+                + self.mask_encoder.output_dim
+                + self.geometry_dim
+            ),
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            zero_effect_initialization=zero_effect_initialization,
+        )
+        self.risk_gate = SelectiveRiskGate(
+            risk_threshold=risk_threshold,
+            quality_veto_threshold=quality_veto_threshold,
+            risk_alpha=risk_alpha,
+            temperature=action_temperature,
+            eps=eps,
+        )
+        self.rectifier = ComponentAlignedSuppressor(
+            remove_threshold=remove_threshold,
+            output_threshold=output_threshold,
+            eps=eps,
+        )
+
+    @property
+    def selective_head(self) -> SelectiveReliabilityHead:
+        """Read-only descriptive alias without duplicate state-dict keys."""
+
+        return self.reliability_head
+
+    @staticmethod
+    def _validate_finite_payload(name: str, value: Any) -> None:
+        if isinstance(value, Tensor):
+            if torch.is_floating_point(value) and not torch.isfinite(value).all():
+                raise ValueError(f"{name} contains NaN or infinite values")
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                SCACRRModule._validate_finite_payload(f"{name}.{key}", item)
+            return
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            for index, item in enumerate(value):
+                SCACRRModule._validate_finite_payload(f"{name}[{index}]", item)
+
+    @staticmethod
+    def _geometry_features(
+        coarse_logits: Tensor,
+        proposal_masks: Tensor,
+        action_masks: Tensor,
+        action_boxes: Tensor,
+        batch_indices: Tensor,
+        scale_features: Tensor,
+    ) -> Tensor:
+        """Return bounded shape/confidence features for each exact component."""
+
+        count, height, width = action_masks.shape
+        if count == 0:
+            return coarse_logits.new_empty((0, 8))
+        probability = coarse_logits.sigmoid()[batch_indices, 0]
+        action_float = action_masks.to(dtype=probability.dtype)
+        action_area = action_float.flatten(1).sum(dim=1).clamp_min(1.0)
+        total_area = float(height * width)
+        area_log_fraction = torch.log1p(action_area) / math.log1p(total_area)
+
+        box_width = (action_boxes[:, 3] - action_boxes[:, 1]).clamp_min(1.0)
+        box_height = (action_boxes[:, 4] - action_boxes[:, 2]).clamp_min(1.0)
+        bbox_area = (box_width * box_height).clamp_min(1.0)
+        compactness = action_area / bbox_area
+
+        masked_probability = probability * action_float
+        action_peak = masked_probability.flatten(1).amax(dim=1)
+        action_mean = masked_probability.flatten(1).sum(dim=1) / action_area
+
+        ring_masks = proposal_masks & ~action_masks
+        ring_float = ring_masks.to(dtype=probability.dtype)
+        ring_area = ring_float.flatten(1).sum(dim=1)
+        ring_mean = (probability * ring_float).flatten(1).sum(dim=1) / ring_area.clamp_min(1.0)
+        ring_mean = torch.where(ring_area > 0, ring_mean, action_mean)
+        core_ring_contrast = action_mean - ring_mean
+        scale_variance = scale_features[:, -1]
+
+        geometry = torch.stack(
+            (
+                area_log_fraction,
+                box_width / float(width),
+                box_height / float(height),
+                compactness,
+                action_peak,
+                action_mean,
+                scale_variance,
+                core_ring_contrast,
+            ),
+            dim=1,
+        )
+        if geometry.shape != (count, 8) or not torch.isfinite(geometry).all():
+            raise ValueError("component geometry features are invalid")
+        return geometry
+
+    def forward(
+        self,
+        feature_map: Tensor,
+        coarse_logits: Tensor,
+        multi_scale_logits: Any,
+        proposal_boxes: Any,
+        proposal_masks: Any = None,
+        action_masks: Any = None,
+        action_boxes: Any = None,
+        candidate_metadata: Mapping[str, Any] | None = None,
+    ) -> tuple[Tensor, dict[str, Any]]:
+        if feature_map.ndim != 4:
+            raise ValueError("feature_map must have shape [B,C,H_f,W_f]")
+        if coarse_logits.ndim != 4 or coarse_logits.shape[1] != 1:
+            raise ValueError("coarse_logits must have shape [B,1,H,W]")
+        if not torch.is_floating_point(feature_map) or not torch.is_floating_point(
+            coarse_logits
+        ):
+            raise TypeError("feature_map and coarse_logits must be floating point")
+        if feature_map.shape[0] != coarse_logits.shape[0]:
+            raise ValueError("feature_map and coarse_logits must have the same batch size")
+        if feature_map.device != coarse_logits.device:
+            raise ValueError("feature_map and coarse_logits must be on the same device")
+        if feature_map.dtype != coarse_logits.dtype:
+            raise ValueError("feature_map and coarse_logits must have the same dtype")
+        if not torch.isfinite(feature_map).all():
+            raise ValueError("feature_map contains NaN or infinite values")
+        if not torch.isfinite(coarse_logits).all():
+            raise ValueError("coarse_logits contain NaN or infinite values")
+
+        candidate_record: Mapping[str, Any] | None = None
+        if isinstance(proposal_boxes, Mapping):
+            candidate_record = proposal_boxes
+            if proposal_masks is None:
+                proposal_masks = candidate_record.get(
+                    "proposal_masks", candidate_record.get("masks")
+                )
+            if action_masks is None:
+                action_masks = candidate_record.get("action_masks")
+            if action_boxes is None:
+                action_boxes = candidate_record.get("action_boxes")
+            proposal_boxes = candidate_record.get("boxes")
+            if candidate_metadata is None:
+                candidate_metadata = candidate_record
+        if candidate_metadata is not None and not isinstance(candidate_metadata, Mapping):
+            raise TypeError("candidate_metadata must be a mapping or None")
+
+        self._validate_finite_payload("proposal_masks", proposal_masks)
+        self._validate_finite_payload("action_masks", action_masks)
+        scale_list = _as_scale_list(multi_scale_logits, self.num_scales)
+        for index, scale_logits in enumerate(scale_list):
+            if not isinstance(scale_logits, Tensor):
+                raise TypeError("each item in multi_scale_logits must be a tensor")
+            if not torch.is_floating_point(scale_logits):
+                raise TypeError("multi_scale_logits must be floating point")
+            if not torch.isfinite(scale_logits).all():
+                raise ValueError(
+                    f"multi_scale_logits[{index}] contains NaN or infinite values"
+                )
+
+        batch_size = coarse_logits.shape[0]
+        output_hw = tuple(coarse_logits.shape[-2:])
+        boxes = _normalise_boxes(
+            proposal_boxes,
+            batch_size=batch_size,
+            device=feature_map.device,
+            dtype=feature_map.dtype,
+        )
+        boxes = _sanitize_boxes(boxes, output_hw, batch_size)
+        num_candidates = boxes.shape[0]
+        proposals = _normalise_masks(
+            proposal_masks,
+            num_candidates=num_candidates,
+            batch_size=batch_size,
+            output_hw=output_hw,
+            device=coarse_logits.device,
+        )
+        actions = _normalise_masks(
+            action_masks,
+            num_candidates=num_candidates,
+            batch_size=batch_size,
+            output_hw=output_hw,
+            device=coarse_logits.device,
+        )
+        if num_candidates and not proposals.flatten(1).any(dim=1).all():
+            raise ValueError("every proposal mask must contain at least one pixel")
+        if num_candidates and not actions.flatten(1).any(dim=1).all():
+            raise ValueError("every action mask must contain at least one pixel")
+        batch_indices = boxes[:, 0].long()
+
+        if action_boxes is None:
+            normalised_action_boxes = ActionMaskEncoder.boxes_from_masks(
+                actions,
+                batch_indices,
+                dtype=feature_map.dtype,
+            )
+        else:
+            normalised_action_boxes = _normalise_boxes(
+                action_boxes,
+                batch_size=batch_size,
+                device=feature_map.device,
+                dtype=feature_map.dtype,
+            )
+            if normalised_action_boxes.shape[0] != num_candidates:
+                raise ValueError(
+                    "action box count must match proposal/action mask count"
+                )
+            normalised_action_boxes = _sanitize_boxes(
+                normalised_action_boxes, output_hw, batch_size
+            )
+            if not torch.equal(
+                normalised_action_boxes[:, 0].long(), batch_indices
+            ):
+                raise ValueError(
+                    "proposal and action boxes must have identical candidate ordering"
+                )
+
+        # Proposal masks are the sole source of scale and context features.
+        scale_features = _extract_scale_features(
+            scale_list,
+            proposals,
+            batch_indices,
+            batch_size=batch_size,
+            output_hw=output_hw,
+            num_scales=self.num_scales,
+            dtype=feature_map.dtype,
+            device=feature_map.device,
+        )
+        proposal_relation_features = self.encoder(
+            feature_map,
+            boxes,
+            candidate_masks=proposals,
+            scale_features=scale_features,
+            image_hw=output_hw,
+        )
+        # Exact action masks are used only for the shape/confidence branch.
+        action_mask_features = self.mask_encoder(
+            coarse_logits,
+            actions,
+            normalised_action_boxes,
+            batch_indices,
+        )
+        geometry_features = self._geometry_features(
+            coarse_logits,
+            proposals,
+            actions,
+            normalised_action_boxes,
+            batch_indices,
+            scale_features,
+        )
+        relation_features = torch.cat(
+            (
+                proposal_relation_features,
+                action_mask_features,
+                geometry_features,
+            ),
+            dim=1,
+        )
+        if not torch.isfinite(relation_features).all():
+            raise ValueError("relation_features contain NaN or infinite values")
+
+        head_outputs = self.reliability_head(relation_features)
+        clutter_scores = head_outputs["clutter_probability"]
+        target_quality = head_outputs["target_quality"]
+        target_scores = 1.0 - clutter_scores
+        class_probs = torch.stack((target_scores, clutter_scores), dim=1)
+        # Symmetric logits preserve softmax(class_logits) == class_probs while
+        # retaining the head's scalar binary logit.
+        class_logits = torch.stack(
+            (
+                -0.5 * head_outputs["clutter_logits"],
+                0.5 * head_outputs["clutter_logits"],
+            ),
+            dim=1,
+        )
+        gate_outputs = self.risk_gate(clutter_scores, target_quality)
+        rectifier_outputs = self.rectifier(
+            coarse_logits,
+            gate_outputs["gate"],
+            actions,
+            batch_indices,
+        )
+
+        candidate_outputs: dict[str, Any] = {
+            # V1/V1.1-compatible fields.
+            "class_logits": class_logits,
+            "class_probs": class_probs,
+            "target_scores": target_scores,
+            "clutter_scores": clutter_scores,
+            "uncertain_scores": clutter_scores.new_zeros((num_candidates,)),
+            "deltas": rectifier_outputs["deltas"],
+            "gates": rectifier_outputs["gates"],
+            "boxes": boxes,
+            "batch_indices": batch_indices,
+            "scale_features": scale_features,
+            "relation_features": relation_features,
+            # SCA-specific, role-explicit fields.
+            "proposal_boxes": boxes,
+            "action_boxes": normalised_action_boxes,
+            "proposal_masks": proposals,
+            "action_masks": actions,
+            # Compatibility aliases action candidates to their exact masks.
+            "candidate_masks": actions,
+            "proposal_relation_features": proposal_relation_features,
+            "action_mask_features": action_mask_features,
+            "geometry_features": geometry_features,
+            "shared_feature": head_outputs["shared_feature"],
+            "clutter_logits": head_outputs["clutter_logits"],
+            "clutter_probability": clutter_scores,
+            "target_quality_logits": head_outputs["target_quality_logits"],
+            "quality_logits": head_outputs["target_quality_logits"],
+            "target_quality": target_quality,
+            "risk_score": gate_outputs["risk_score"],
+            "quality_veto": gate_outputs["quality_veto"],
+            "soft_action": gate_outputs["soft_action"],
+            "required_deltas": rectifier_outputs["required_deltas"],
+            "unclipped_required_deltas": rectifier_outputs[
+                "unclipped_required_deltas"
+            ],
+            "peak_logits": rectifier_outputs["peak_logits"],
+            "active_support": rectifier_outputs["active_support"],
+        }
+        if candidate_metadata is not None:
+            candidate_outputs["candidate_metadata"] = candidate_metadata
+            # Preserve useful per-candidate audit identifiers/scores at the
+            # top level without allowing metadata to overwrite model fields.
+            for key, value in candidate_metadata.items():
+                if key not in candidate_outputs and isinstance(value, Tensor):
+                    candidate_outputs[key] = value.to(device=coarse_logits.device)
+        return rectifier_outputs["refined_logits"], candidate_outputs
+
+
 __all__ = [
     "CandidateContextEncoder",
     "ReliabilityHead",
+    "SelectiveReliabilityHead",
+    "ActionMaskEncoder",
     "InstanceLogitRectifier",
     "SafeClutterSuppressor",
     "ThresholdAwareClutterSuppressor",
+    "SelectiveRiskGate",
+    "ComponentAlignedSuppressor",
     "CCRRModule",
+    "SCACRRModule",
 ]

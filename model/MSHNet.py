@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections.abc import Mapping
 
-from model.ccrr import CCRRModule
-from utils.candidate import generate_candidates
+from model.ccrr import CCRRModule, SCACRRModule
+from utils.candidate import generate_candidates, generate_component_aligned_candidates
 
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
@@ -98,12 +99,35 @@ class MSHNet(nn.Module):
         self.output_3 = nn.Conv2d(param_channels[3], 1, 1)
 
         self.final = nn.Conv2d(4, 1, 3, 1, 1)
+        self.ccrr_variant = None
+        self.ccrr_feature_adapter = None
         if ccrr_config is None:
             self.ccrr = None
         else:
             ccrr_config = dict(ccrr_config)
-            ccrr_config.setdefault('feature_channels', param_channels[0])
-            self.ccrr = CCRRModule(**ccrr_config)
+            self.ccrr_variant = ccrr_config.pop('variant', 'v1_safe')
+            if self.ccrr_variant == 'v2_selective_component':
+                feature_channels = int(ccrr_config.setdefault('feature_channels', 32))
+                if feature_channels <= 0 or feature_channels % 4 != 0:
+                    raise ValueError(
+                        'SCA feature_channels must be positive and divisible by 4'
+                    )
+                self.ccrr_feature_adapter = nn.Sequential(
+                    nn.Conv2d(
+                        param_channels[0] + param_channels[1] + param_channels[2],
+                        feature_channels,
+                        kernel_size=1,
+                        bias=False,
+                    ),
+                    nn.GroupNorm(4, feature_channels),
+                    nn.ReLU(inplace=True),
+                )
+                self.ccrr = SCACRRModule(**ccrr_config)
+            else:
+                if self.ccrr_variant not in ('v1_safe', 'v1_threshold_aware'):
+                    raise ValueError(f'unsupported CCRR variant: {self.ccrr_variant!r}')
+                ccrr_config.setdefault('feature_channels', param_channels[0])
+                self.ccrr = CCRRModule(**ccrr_config)
 
 
     def _make_layer(self, in_channels, out_channels, block, block_num=1):
@@ -168,23 +192,71 @@ class MSHNet(nn.Module):
             raise RuntimeError('enable_ccrr=True requires ccrr_config when constructing MSHNet')
 
         generated_candidates = None
-        if candidate_boxes is None:
-            generated_candidates = generate_candidates(
+        if self.ccrr_variant == 'v2_selective_component':
+            if self.ccrr_feature_adapter is None:
+                raise RuntimeError('SCA feature adapter is unavailable')
+            ccrr_feature = self.ccrr_feature_adapter(
+                torch.cat(
+                    [
+                        x_d0,
+                        F.interpolate(
+                            x_d1,
+                            size=x_d0.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False,
+                        ),
+                        F.interpolate(
+                            x_d2,
+                            size=x_d0.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False,
+                        ),
+                    ],
+                    dim=1,
+                )
+            )
+            if candidate_boxes is None:
+                generated_candidates = generate_component_aligned_candidates(
+                    coarse_logits=coarse_logits,
+                    multi_scale_logits=multi_scale_logits,
+                    proposal_threshold=candidate_threshold,
+                    output_threshold=0.5,
+                    min_area=min_candidate_area,
+                    max_area=max_candidate_area,
+                )
+                candidate_boxes = generated_candidates
+            if not isinstance(candidate_boxes, Mapping):
+                raise TypeError(
+                    'SCA candidates must be a component-aligned candidate mapping'
+                )
+            refined_logits, candidate_outputs = self.ccrr(
+                feature_map=ccrr_feature,
                 coarse_logits=coarse_logits,
                 multi_scale_logits=multi_scale_logits,
-                threshold_low=candidate_threshold,
-                min_area=min_candidate_area,
-                max_area=max_candidate_area,
+                proposal_boxes=candidate_boxes,
+                proposal_masks=candidate_boxes.get('proposal_masks'),
+                action_masks=candidate_boxes.get('action_masks'),
+                action_boxes=candidate_boxes.get('action_boxes'),
+                candidate_metadata=candidate_boxes,
             )
-            candidate_boxes = generated_candidates
+        else:
+            if candidate_boxes is None:
+                generated_candidates = generate_candidates(
+                    coarse_logits=coarse_logits,
+                    multi_scale_logits=multi_scale_logits,
+                    threshold_low=candidate_threshold,
+                    min_area=min_candidate_area,
+                    max_area=max_candidate_area,
+                )
+                candidate_boxes = generated_candidates
 
-        refined_logits, candidate_outputs = self.ccrr(
-            feature_map=x_d0,
-            coarse_logits=coarse_logits,
-            multi_scale_logits=multi_scale_logits,
-            candidate_boxes=candidate_boxes,
-            candidate_masks=candidate_masks,
-        )
+            refined_logits, candidate_outputs = self.ccrr(
+                feature_map=x_d0,
+                coarse_logits=coarse_logits,
+                multi_scale_logits=multi_scale_logits,
+                candidate_boxes=candidate_boxes,
+                candidate_masks=candidate_masks,
+            )
 
         if generated_candidates is not None:
             for key, value in generated_candidates.items():
@@ -193,4 +265,3 @@ class MSHNet(nn.Module):
         outputs['refined_logits'] = refined_logits
         outputs['candidate_outputs'] = candidate_outputs
         return outputs
-

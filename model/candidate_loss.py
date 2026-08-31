@@ -13,6 +13,7 @@ All losses return a differentiable zero for an empty candidate batch.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import Any
 
 import torch
@@ -395,6 +396,243 @@ class CandidateBrierLoss(nn.Module):
         return per_candidate[valid].mean()
 
 
+class TargetQualityLoss(nn.Module):
+    """Smooth-L1 supervision for continuous target-presence quality.
+
+    Both arguments are candidate-wise probabilities with shape ``[N]`` and
+    values in ``[0, 1]``.  The target quality is the continuous component/GT
+    agreement defined by SCA-CCRR, rather than a binary target label.
+    """
+
+    def __init__(
+        self,
+        *,
+        beta: float = 1.0,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        _validate_reduction(reduction)
+        if not math.isfinite(beta) or beta <= 0:
+            raise ValueError("beta must be finite and positive")
+        self.beta = float(beta)
+        self.reduction = reduction
+
+    def forward(
+        self,
+        predicted_target_quality: Tensor,
+        target_quality_gt: Tensor,
+    ) -> Tensor:
+        if not isinstance(predicted_target_quality, Tensor):
+            raise TypeError("predicted_target_quality must be a tensor")
+        if not isinstance(target_quality_gt, Tensor):
+            raise TypeError("target_quality_gt must be a tensor")
+        if predicted_target_quality.ndim != 1:
+            raise ValueError(
+                "predicted_target_quality must have shape [N], got "
+                f"{tuple(predicted_target_quality.shape)}"
+            )
+        if target_quality_gt.ndim != 1:
+            raise ValueError(
+                f"target_quality_gt must have shape [N], got {tuple(target_quality_gt.shape)}"
+            )
+        if predicted_target_quality.shape != target_quality_gt.shape:
+            raise ValueError(
+                "predicted_target_quality and target_quality_gt must have identical "
+                f"shapes, got {tuple(predicted_target_quality.shape)} and "
+                f"{tuple(target_quality_gt.shape)}"
+            )
+        if not predicted_target_quality.is_floating_point():
+            raise TypeError("predicted_target_quality must be floating point")
+        if not target_quality_gt.is_floating_point():
+            raise TypeError("target_quality_gt must be floating point")
+        if predicted_target_quality.device != target_quality_gt.device:
+            raise ValueError(
+                "predicted_target_quality and target_quality_gt must be on the same device"
+            )
+        if not torch.isfinite(predicted_target_quality).all():
+            raise ValueError("predicted_target_quality must be finite")
+        if not torch.isfinite(target_quality_gt).all():
+            raise ValueError("target_quality_gt must be finite")
+        if (
+            (predicted_target_quality < 0).any()
+            or (predicted_target_quality > 1).any()
+        ):
+            raise ValueError("predicted_target_quality must lie in [0, 1]")
+        if (target_quality_gt < 0).any() or (target_quality_gt > 1).any():
+            raise ValueError("target_quality_gt must lie in [0, 1]")
+
+        if predicted_target_quality.numel() == 0:
+            if self.reduction == "none":
+                return (
+                    predicted_target_quality
+                    + predicted_target_quality.sum() * 0.0
+                )
+            return _zero_loss(predicted_target_quality)
+
+        return F.smooth_l1_loss(
+            predicted_target_quality,
+            target_quality_gt.to(dtype=predicted_target_quality.dtype),
+            beta=self.beta,
+            reduction=self.reduction,
+        )
+
+
+def _validate_component_membership(
+    membership: Tensor,
+    *,
+    name: str,
+    reference: Tensor,
+) -> None:
+    """Validate a component-selection mask against a candidate vector."""
+
+    if not isinstance(membership, Tensor):
+        raise TypeError(f"{name} must be a tensor")
+    if membership.ndim != 1 or membership.shape != reference.shape:
+        raise ValueError(
+            f"{name} must have shape {tuple(reference.shape)}, got "
+            f"{tuple(membership.shape)}"
+        )
+    if membership.dtype != torch.bool:
+        raise TypeError(f"{name} must have dtype torch.bool")
+    if membership.device != reference.device:
+        raise ValueError(f"{name} and the candidate scores must be on the same device")
+
+
+def _validate_component_partition(
+    is_target_component: Tensor,
+    is_fp_component: Tensor,
+    *,
+    reference: Tensor,
+) -> None:
+    _validate_component_membership(
+        is_target_component,
+        name="is_target_component",
+        reference=reference,
+    )
+    _validate_component_membership(
+        is_fp_component,
+        name="is_fp_component",
+        reference=reference,
+    )
+    if (is_target_component & is_fp_component).any():
+        raise ValueError(
+            "a candidate cannot be both a target component and an FP component"
+        )
+
+
+class AsymmetricActionRiskLoss(nn.Module):
+    """Penalize target deletion much more strongly than missed clutter.
+
+    ``gates`` is the soft probability of suppressing each action component.
+    Target components therefore contribute ``gate``, whereas false-positive
+    components contribute ``1 - gate``.  Candidates marked by neither mask
+    are ignored.
+    """
+
+    def __init__(
+        self,
+        target_harm_weight: float = 20.0,
+        missed_clutter_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if not math.isfinite(target_harm_weight) or target_harm_weight < 0:
+            raise ValueError("target_harm_weight must be finite and non-negative")
+        if not math.isfinite(missed_clutter_weight) or missed_clutter_weight < 0:
+            raise ValueError(
+                "missed_clutter_weight must be finite and non-negative"
+            )
+        self.target_harm_weight = float(target_harm_weight)
+        self.missed_clutter_weight = float(missed_clutter_weight)
+
+    def forward(
+        self,
+        gates: Tensor,
+        is_target_component: Tensor,
+        is_fp_component: Tensor,
+    ) -> dict[str, Tensor]:
+        if not isinstance(gates, Tensor):
+            raise TypeError("gates must be a tensor")
+        if gates.ndim != 1:
+            raise ValueError(f"gates must have shape [N], got {tuple(gates.shape)}")
+        if not gates.is_floating_point():
+            raise TypeError("gates must be floating point")
+        if not torch.isfinite(gates).all():
+            raise ValueError("gates must be finite")
+        if (gates < 0).any() or (gates > 1).any():
+            raise ValueError("gates must lie in [0, 1]")
+        _validate_component_partition(
+            is_target_component,
+            is_fp_component,
+            reference=gates,
+        )
+
+        zero = _zero_loss(gates)
+        target_harm = zero
+        if is_target_component.any():
+            target_harm = gates[is_target_component].mean()
+
+        missed_clutter = zero
+        if is_fp_component.any():
+            missed_clutter = (1.0 - gates[is_fp_component]).mean()
+
+        total = (
+            self.target_harm_weight * target_harm
+            + self.missed_clutter_weight * missed_clutter
+        )
+        return {
+            "total": total,
+            "target_harm": target_harm,
+            "missed_clutter": missed_clutter,
+        }
+
+
+class CandidateRankLoss(nn.Module):
+    """Pairwise margin loss that ranks FP risk above target-component risk.
+
+    For every false-positive/target pair this computes
+    ``relu(margin - fp_risk + target_risk)`` and returns the pairwise mean.
+    Candidates marked by neither component mask are ignored.
+    """
+
+    def __init__(self, margin: float = 0.5) -> None:
+        super().__init__()
+        if not math.isfinite(margin) or margin < 0:
+            raise ValueError("margin must be finite and non-negative")
+        self.margin = float(margin)
+
+    def forward(
+        self,
+        risk_scores: Tensor,
+        is_target_component: Tensor,
+        is_fp_component: Tensor,
+    ) -> Tensor:
+        if not isinstance(risk_scores, Tensor):
+            raise TypeError("risk_scores must be a tensor")
+        if risk_scores.ndim != 1:
+            raise ValueError(
+                f"risk_scores must have shape [N], got {tuple(risk_scores.shape)}"
+            )
+        if not risk_scores.is_floating_point():
+            raise TypeError("risk_scores must be floating point")
+        if not torch.isfinite(risk_scores).all():
+            raise ValueError("risk_scores must be finite")
+        _validate_component_partition(
+            is_target_component,
+            is_fp_component,
+            reference=risk_scores,
+        )
+
+        if not is_target_component.any() or not is_fp_component.any():
+            return _zero_loss(risk_scores)
+
+        target_risk = risk_scores[is_target_component]
+        fp_risk = risk_scores[is_fp_component]
+        pairwise_loss = F.relu(
+            self.margin - fp_risk[:, None] + target_risk[None, :]
+        )
+        return pairwise_loss.mean()
+
+
 class RectificationPreservationLoss(nn.Module):
     """Keep target responses while suppressing clutter after rectification.
 
@@ -723,6 +961,9 @@ __all__ = [
     "CandidateClassificationLoss",
     "CandidateBinaryFocalLoss",
     "CandidateBrierLoss",
+    "TargetQualityLoss",
+    "AsymmetricActionRiskLoss",
+    "CandidateRankLoss",
     "RectificationPreservationLoss",
     "CCRRLoss",
 ]

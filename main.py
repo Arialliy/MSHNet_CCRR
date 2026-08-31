@@ -32,7 +32,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from model.MSHNet import MSHNet
-from model.candidate_loss import CCRRLoss
+from model.candidate_loss import (
+    AsymmetricActionRiskLoss,
+    CandidateBinaryFocalLoss,
+    CandidateRankLoss,
+    CCRRLoss,
+    TargetQualityLoss,
+)
 from model.loss import AverageMeter, SLSIoULoss
 from utils.candidate import (
     CLUTTER_LABEL,
@@ -42,7 +48,11 @@ from utils.candidate import (
     match_candidates_to_gt,
 )
 from utils.data import IRSTD_Dataset
-from utils.detection_metric import SegmentationFROC, maximum_centroid_pairs
+from utils.detection_metric import (
+    SegmentationFROC,
+    match_prediction_components_to_gt,
+    maximum_centroid_pairs,
+)
 from utils.metric import PD_FA
 from utils.reliability_metric import (
     candidate_brier_score,
@@ -57,6 +67,7 @@ from utils.reliability_metric import (
 
 CANDIDATE_BANK_SCHEMA_VERSION = "mshnet-ccrr-candidate-bank/v1"
 WEIGHT_SCHEMA_VERSION = "mshnet-ccrr-weight/v2-safe"
+SCA_WEIGHT_SCHEMA_VERSION = "mshnet-sca-ccrr-weight/v1"
 
 
 def str2bool(value: Any) -> bool:
@@ -109,11 +120,12 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--ccrr-version",
-        choices=("v1_safe", "v1_threshold_aware"),
+        choices=("v1_safe", "v1_threshold_aware", "v2_selective_component"),
         default="v1_safe",
         help=(
             "Keep v1_safe for exact historical reproduction; use "
-            "v1_threshold_aware for the audited V1.1 action executor."
+            "v1_threshold_aware for the audited V1.1 action executor; use "
+            "v2_selective_component for component-aligned quality-veto SCA-CCRR."
         ),
     )
     parser.add_argument("--candidate-bank", default="")
@@ -157,6 +169,11 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
         help="V1.1 action cap in logits; 0 uses the audited exact/unbounded correction.",
     )
     parser.add_argument("--ccrr-num-classes", type=int, choices=(2, 3), default=2)
+    parser.add_argument("--sca-roi-size", type=int, default=15)
+    parser.add_argument("--sca-feature-channels", type=int, default=32)
+    parser.add_argument("--risk-threshold", type=float, default=2.0)
+    parser.add_argument("--quality-veto-threshold", type=float, default=0.20)
+    parser.add_argument("--risk-alpha", type=float, default=1.0)
     parser.add_argument("--ccrr-lr", type=float, default=3e-4)
     parser.add_argument("--backbone-lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
@@ -179,6 +196,15 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--clutter-focal-gamma", type=float, default=2.0)
     parser.add_argument("--clutter-positive-alpha", type=float, default=0.75)
+    parser.add_argument("--lambda-clutter-cls", type=float, default=1.0)
+    parser.add_argument("--lambda-quality", type=float, default=1.0)
+    parser.add_argument("--lambda-action-risk", type=float, default=1.0)
+    parser.add_argument("--lambda-rank", type=float, default=0.1)
+    parser.add_argument("--target-harm-weight", type=float, default=20.0)
+    parser.add_argument("--missed-clutter-weight", type=float, default=1.0)
+    parser.add_argument("--rank-margin", type=float, default=0.5)
+    parser.add_argument("--quality-iou-weight", type=float, default=0.5)
+    parser.add_argument("--quality-center-sigma", type=float, default=3.0)
     parser.add_argument("--target-allowed-peak-drop", type=float, default=0.01)
     parser.add_argument(
         "--clutter-peak-ceiling",
@@ -776,6 +802,10 @@ class DetectionMetrics:
 
 class Trainer:
     def __init__(self, args: argparse.Namespace) -> None:
+        # Preserve compatibility with legacy tests and callers that build an
+        # argparse-like namespace before the versioned CCRR CLI existed.
+        if not hasattr(args, "ccrr_version"):
+            args.ccrr_version = "v1_safe"
         self.args = args
         self.mode = args.mode
         self.start_epoch = 0
@@ -852,18 +882,36 @@ class Trainer:
 
         ccrr_config = None
         if args.enable_ccrr:
-            ccrr_config = {
-                "num_scales": 4,
-                "roi_size": args.roi_size,
-                "hidden_dim": args.hidden_dim,
-                "context_scale": args.context_scale,
-                "min_context_size": args.min_context_size,
-                "dropout": args.ccrr_dropout,
-                "max_delta": args.max_delta,
-                "gate_margin": args.gate_margin,
-                "gate_temperature": args.gate_temperature,
-                "num_classes": args.ccrr_num_classes,
-            }
+            if args.ccrr_version == "v2_selective_component":
+                ccrr_config = {
+                    "variant": "v2_selective_component",
+                    "feature_channels": args.sca_feature_channels,
+                    "num_scales": 4,
+                    "roi_size": args.sca_roi_size,
+                    "hidden_dim": args.hidden_dim,
+                    "context_scale": args.context_scale,
+                    "min_context_size": args.min_context_size,
+                    "dropout": args.ccrr_dropout,
+                    "risk_threshold": args.risk_threshold,
+                    "quality_veto_threshold": args.quality_veto_threshold,
+                    "risk_alpha": args.risk_alpha,
+                    "action_temperature": args.action_temperature,
+                    "remove_threshold": args.clutter_peak_ceiling,
+                    "output_threshold": 0.5,
+                }
+            else:
+                ccrr_config = {
+                    "num_scales": 4,
+                    "roi_size": args.roi_size,
+                    "hidden_dim": args.hidden_dim,
+                    "context_scale": args.context_scale,
+                    "min_context_size": args.min_context_size,
+                    "dropout": args.ccrr_dropout,
+                    "max_delta": args.max_delta,
+                    "gate_margin": args.gate_margin,
+                    "gate_temperature": args.gate_temperature,
+                    "num_classes": args.ccrr_num_classes,
+                }
             if args.ccrr_version == "v1_threshold_aware":
                 ccrr_config.update(
                     {
@@ -892,7 +940,24 @@ class Trainer:
 
         self.loss_fun = SLSIoULoss()
         self.ccrr_loss: CCRRLoss | None = None
-        if args.enable_ccrr:
+        self.sca_clutter_loss: CandidateBinaryFocalLoss | None = None
+        self.sca_quality_loss: TargetQualityLoss | None = None
+        self.sca_risk_loss: AsymmetricActionRiskLoss | None = None
+        self.sca_rank_loss: CandidateRankLoss | None = None
+        if args.enable_ccrr and args.ccrr_version == "v2_selective_component":
+            self.sca_clutter_loss = CandidateBinaryFocalLoss(
+                gamma=args.clutter_focal_gamma,
+                positive_alpha=args.clutter_positive_alpha,
+                ignore_index=-1,
+            )
+            self.sca_quality_loss = TargetQualityLoss()
+            self.sca_risk_loss = AsymmetricActionRiskLoss(
+                target_harm_weight=args.target_harm_weight,
+                missed_clutter_weight=args.missed_clutter_weight,
+            )
+            self.sca_rank_loss = CandidateRankLoss(margin=args.rank_margin)
+            args.resolved_candidate_class_weights = []
+        elif args.enable_ccrr:
             if args.ccrr_version == "v1_threshold_aware":
                 class_weights = None
                 resolved_class_weights: list[float] = []
@@ -974,6 +1039,10 @@ class Trainer:
             raise ValueError("--test-start-epoch must be non-negative")
         if self.args.hidden_dim <= 0:
             raise ValueError("--hidden-dim must be positive")
+        if self.args.sca_roi_size <= 0:
+            raise ValueError("--sca-roi-size must be positive")
+        if self.args.sca_feature_channels <= 0 or self.args.sca_feature_channels % 4:
+            raise ValueError("--sca-feature-channels must be positive and divisible by 4")
         if self.args.min_context_size <= 0 or self.args.context_scale <= 0:
             raise ValueError("context sizes must be positive")
         if not 0.0 <= self.args.ccrr_dropout < 1.0:
@@ -1000,6 +1069,20 @@ class Trainer:
             raise ValueError("--clutter-focal-gamma must be non-negative")
         if not 0.0 <= self.args.clutter_positive_alpha <= 1.0:
             raise ValueError("--clutter-positive-alpha must lie in [0, 1]")
+        if not math.isfinite(self.args.risk_threshold):
+            raise ValueError("--risk-threshold must be finite")
+        if not 0.0 <= self.args.quality_veto_threshold <= 1.0:
+            raise ValueError("--quality-veto-threshold must lie in [0,1]")
+        if not math.isfinite(self.args.risk_alpha) or self.args.risk_alpha < 0:
+            raise ValueError("--risk-alpha must be finite and non-negative")
+        if not 0.0 <= self.args.quality_iou_weight <= 1.0:
+            raise ValueError("--quality-iou-weight must lie in [0,1]")
+        if not math.isfinite(self.args.quality_center_sigma) or self.args.quality_center_sigma <= 0:
+            raise ValueError("--quality-center-sigma must be finite and positive")
+        if self.args.target_harm_weight < 0 or self.args.missed_clutter_weight < 0:
+            raise ValueError("SCA risk weights must be non-negative")
+        if self.args.rank_margin < 0:
+            raise ValueError("--rank-margin must be non-negative")
         if not 0.0 <= self.args.target_allowed_peak_drop <= 1.0:
             raise ValueError("--target-allowed-peak-drop must lie in [0, 1]")
         if not 0.0 <= self.args.clutter_peak_ceiling <= 1.0:
@@ -1021,6 +1104,20 @@ class Trainer:
                     "v1_threshold_aware uses online candidates; omit "
                     "--candidate-bank and --test-candidate-bank"
                 )
+        if self.args.enable_ccrr and self.args.ccrr_version == "v2_selective_component":
+            if self.args.ccrr_num_classes != 2:
+                raise ValueError("v2_selective_component requires --ccrr-num-classes 2")
+            if self.args.candidate_bank or self.args.test_candidate_bank:
+                raise ValueError(
+                    "v2_selective_component uses online component-aligned candidates; "
+                    "omit --candidate-bank and --test-candidate-bank"
+                )
+            if not math.isclose(self.args.candidate_threshold, 0.2, abs_tol=1e-12):
+                raise ValueError("v2_selective_component fixes --candidate-threshold at 0.2")
+            if not 0.0 < self.args.clutter_peak_ceiling < 0.5:
+                raise ValueError(
+                    "v2_selective_component requires --remove-threshold in (0,0.5)"
+                )
         if (
             self.args.mode == "train"
             and self.args.enable_ccrr
@@ -1039,6 +1136,10 @@ class Trainer:
             "lambda_candidate",
             "lambda_calibration",
             "lambda_preservation",
+            "lambda_clutter_cls",
+            "lambda_quality",
+            "lambda_action_risk",
+            "lambda_rank",
         ):
             if getattr(self.args, name) < 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
@@ -1061,6 +1162,11 @@ class Trainer:
     def _state_model(self) -> MSHNet:
         return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
+    def _weight_schema_version(self) -> str:
+        if self.args.enable_ccrr and self.args.ccrr_version == "v2_selective_component":
+            return SCA_WEIGHT_SCHEMA_VERSION
+        return WEIGHT_SCHEMA_VERSION
+
     def _dataset_contract(self, dataset: Data.Dataset) -> dict[str, Any]:
         source = dataset.dataset if isinstance(dataset, Data.Subset) else dataset
         names = self._dataset_names(dataset)
@@ -1078,7 +1184,14 @@ class Trainer:
     def _inference_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {
             "schema_version": "mshnet-ccrr-inference/v2-safe",
-            "model_variant": "MSHNet+CCRR" if self.args.enable_ccrr else "MSHNet",
+            "model_variant": (
+                "MSHNet+SCA-CCRR"
+                if self.args.enable_ccrr
+                and self.args.ccrr_version == "v2_selective_component"
+                else "MSHNet+CCRR"
+                if self.args.enable_ccrr
+                else "MSHNet"
+            ),
             "enable_ccrr": bool(self.args.enable_ccrr),
             "input_channels": 3,
             "feature_channels": 16,
@@ -1094,7 +1207,11 @@ class Trainer:
                     "candidate_threshold": float(self.args.candidate_threshold),
                     "min_candidate_area": int(self.args.min_candidate_area),
                     "max_candidate_area": int(self.args.max_candidate_area),
-                    "roi_size": int(self.args.roi_size),
+                    "roi_size": int(
+                        self.args.sca_roi_size
+                        if self.args.ccrr_version == "v2_selective_component"
+                        else self.args.roi_size
+                    ),
                     "hidden_dim": int(self.args.hidden_dim),
                     "context_scale": float(self.args.context_scale),
                     "min_context_size": float(self.args.min_context_size),
@@ -1128,6 +1245,45 @@ class Trainer:
                         "output_probability_threshold": 0.5,
                     }
                 )
+            elif self.args.ccrr_version == "v2_selective_component":
+                config.update(
+                    {
+                        "schema_version": "mshnet-sca-ccrr-inference/v1",
+                        "ccrr_version": "v2_selective_component",
+                        "ccrr_feature_channels": int(
+                            self.args.sca_feature_channels
+                        ),
+                        "feature_sources": ["x_d0", "x_d1", "x_d2"],
+                        "geometry_features": [
+                            "log_area_fraction",
+                            "normalized_width",
+                            "normalized_height",
+                            "compactness",
+                            "coarse_peak_probability",
+                            "coarse_mean_probability",
+                            "scale_variance",
+                            "core_ring_probability_contrast",
+                        ],
+                        "component_aligned": True,
+                        "proposal_mask_use": "feature_encoding_only",
+                        "action_mask_use": "label_suppression_and_evaluation",
+                        "action_component_source": "coarse_probability_gt_0.5",
+                        "rectifier": "component_aligned_threshold_aware",
+                        "risk_threshold": float(self.args.risk_threshold),
+                        "quality_veto_threshold": float(
+                            self.args.quality_veto_threshold
+                        ),
+                        "risk_alpha": float(self.args.risk_alpha),
+                        "action_temperature": float(
+                            self.args.action_temperature
+                        ),
+                        "remove_threshold": float(
+                            self.args.clutter_peak_ceiling
+                        ),
+                        "output_probability_threshold": 0.5,
+                        "default_action": "keep",
+                    }
+                )
         return config
 
     def _evaluation_config(self) -> dict[str, Any]:
@@ -1152,7 +1308,10 @@ class Trainer:
                     "positive_iou": float(self.args.positive_iou),
                 }
             )
-            if self.args.ccrr_version == "v1_threshold_aware":
+            if self.args.ccrr_version in (
+                "v1_threshold_aware",
+                "v2_selective_component",
+            ):
                 test_source = self.test_loader.dataset
                 if isinstance(test_source, Data.Subset):
                     test_source = test_source.dataset
@@ -1164,6 +1323,20 @@ class Trainer:
                         "raw_test_split_sha256": _file_sha256(
                             Path(test_source.list_dir)
                         ),
+                    }
+                )
+            if self.args.ccrr_version == "v2_selective_component":
+                config.update(
+                    {
+                        "schema_version": "mshnet-sca-ccrr-evaluation/v1",
+                        "ccrr_version": "v2_selective_component",
+                        "component_label_source": "exact_action_mask",
+                        "component_matching": (
+                            "8_connected_maximum_cardinality_centroid"
+                        ),
+                        "threshold_operator": ">",
+                        "distance_operator": "<=",
+                        "test_guided_development": True,
                     }
                 )
         return config
@@ -1248,6 +1421,80 @@ class Trainer:
                         ),
                     }
                 )
+            elif self.args.ccrr_version == "v2_selective_component":
+                train_source = (
+                    self.train_loader.dataset
+                    if self.train_loader is not None
+                    else None
+                )
+                if isinstance(train_source, Data.Subset):
+                    train_source = train_source.dataset
+                trainable_prefixes = ["ccrr.", "ccrr_feature_adapter."]
+                if self.args.ccrr_stage == "joint":
+                    trainable_prefixes.extend(
+                        ["decoder_0.", "output_0.", "final."]
+                    )
+                config.update(
+                    {
+                        "schema_version": "mshnet-sca-ccrr-training/v1",
+                        "ccrr_version": "v2_selective_component",
+                        "training_label_mode": (
+                            "exact_component_shared_evaluation_matching"
+                        ),
+                        "ambiguous_action": "keep_ignore",
+                        "classification_loss": "class_balanced_binary_focal",
+                        "label_smoothing": None,
+                        "clutter_focal_gamma": float(
+                            self.args.clutter_focal_gamma
+                        ),
+                        "clutter_positive_alpha": float(
+                            self.args.clutter_positive_alpha
+                        ),
+                        "quality_loss": "smooth_l1",
+                        "quality_iou_weight": float(
+                            self.args.quality_iou_weight
+                        ),
+                        "quality_center_sigma": float(
+                            self.args.quality_center_sigma
+                        ),
+                        "action_loss": "asymmetric_selective_risk",
+                        "risk_threshold": float(self.args.risk_threshold),
+                        "quality_veto_threshold": float(
+                            self.args.quality_veto_threshold
+                        ),
+                        "risk_alpha": float(self.args.risk_alpha),
+                        "action_temperature": float(
+                            self.args.action_temperature
+                        ),
+                        "lambda_clutter_cls": float(
+                            self.args.lambda_clutter_cls
+                        ),
+                        "lambda_quality": float(self.args.lambda_quality),
+                        "lambda_action_risk": float(
+                            self.args.lambda_action_risk
+                        ),
+                        "lambda_rank": float(self.args.lambda_rank),
+                        "target_harm_weight": float(
+                            self.args.target_harm_weight
+                        ),
+                        "missed_clutter_weight": float(
+                            self.args.missed_clutter_weight
+                        ),
+                        "rank_margin": float(self.args.rank_margin),
+                        "calibration_protocol": (
+                            "pre_registered_fixed_risk_and_quality_thresholds"
+                        ),
+                        "development_selection_source": "official_test",
+                        "max_train_batches": int(self.args.max_train_batches),
+                        "num_workers": int(self.args.num_workers),
+                        "raw_train_split_sha256": (
+                            _file_sha256(Path(train_source.list_dir))
+                            if train_source is not None
+                            else None
+                        ),
+                        "trainable_prefixes": trainable_prefixes,
+                    }
+                )
         return config
 
     @staticmethod
@@ -1297,7 +1544,12 @@ class Trainer:
                     "use a structured best/checkpoint artifact"
                 )
             return
-        if checkpoint.get("checkpoint_schema") != WEIGHT_SCHEMA_VERSION:
+        expected_schema = (
+            WEIGHT_SCHEMA_VERSION
+            if baseline_initialization
+            else self._weight_schema_version()
+        )
+        if checkpoint.get("checkpoint_schema") != expected_schema:
             raise RuntimeError(f"weight {path!r} has an unsupported checkpoint schema")
 
         saved_inference = checkpoint["inference_config"]
@@ -1353,7 +1605,7 @@ class Trainer:
         selection_value: float | None = None,
     ) -> dict[str, Any]:
         return {
-            "checkpoint_schema": WEIGHT_SCHEMA_VERSION,
+            "checkpoint_schema": self._weight_schema_version(),
             "net": state_dict,
             "epoch": int(epoch),
             "selection_metric": selection_metric,
@@ -1410,11 +1662,16 @@ class Trainer:
             self._state_model().load_state_dict(state_dict, strict=True)
         else:
             incompatible = self._state_model().load_state_dict(state_dict, strict=False)
+            allowed_head_prefixes = ("ccrr.", "ccrr_feature_adapter.")
             missing_ccrr = [
-                key for key in incompatible.missing_keys if key.startswith("ccrr.")
+                key
+                for key in incompatible.missing_keys
+                if key.startswith(allowed_head_prefixes)
             ]
             invalid_missing = [
-                key for key in incompatible.missing_keys if not key.startswith("ccrr.")
+                key
+                for key in incompatible.missing_keys
+                if not key.startswith(allowed_head_prefixes)
             ]
             if checkpoint_has_ccrr:
                 invalid_missing.extend(missing_ccrr)
@@ -1466,7 +1723,7 @@ class Trainer:
                 "exact resume requires the full checkpoint.pkl; missing fields: "
                 + ", ".join(missing_fields)
             )
-        if checkpoint.get("checkpoint_schema") != WEIGHT_SCHEMA_VERSION:
+        if checkpoint.get("checkpoint_schema") != self._weight_schema_version():
             raise RuntimeError("exact resume checkpoint has an unsupported schema")
         if not isinstance(checkpoint["net"], Mapping):
             raise RuntimeError("exact resume checkpoint has an invalid net state")
@@ -1597,10 +1854,15 @@ class Trainer:
         if self.mode != "train" or not self.args.enable_ccrr:
             return
         if self.args.ccrr_stage == "head_only":
+            trainable_prefixes = ("ccrr.",)
+            if self.args.ccrr_version == "v2_selective_component":
+                trainable_prefixes += ("ccrr_feature_adapter.",)
             for name, parameter in self._state_model().named_parameters():
-                parameter.requires_grad = name.startswith("ccrr.")
+                parameter.requires_grad = name.startswith(trainable_prefixes)
             return
         trainable_prefixes = ("ccrr.", "decoder_0.", "output_0.", "final.")
+        if self.args.ccrr_version == "v2_selective_component":
+            trainable_prefixes += ("ccrr_feature_adapter.",)
         for name, parameter in self._state_model().named_parameters():
             parameter.requires_grad = name.startswith(trainable_prefixes)
 
@@ -1611,10 +1873,13 @@ class Trainer:
                 lr=self.args.lr,
             )
         named_parameters = list(self._state_model().named_parameters())
+        head_prefixes = ("ccrr.",)
+        if self.args.ccrr_version == "v2_selective_component":
+            head_prefixes += ("ccrr_feature_adapter.",)
         ccrr_parameters = [
             parameter
             for name, parameter in named_parameters
-            if name.startswith("ccrr.") and parameter.requires_grad
+            if name.startswith(head_prefixes) and parameter.requires_grad
         ]
         parameter_groups: list[dict[str, Any]] = [
             {"params": ccrr_parameters, "lr": self.args.ccrr_lr}
@@ -1622,7 +1887,7 @@ class Trainer:
         other_parameters = [
             parameter
             for name, parameter in named_parameters
-            if not name.startswith("ccrr.") and parameter.requires_grad
+            if not name.startswith(head_prefixes) and parameter.requires_grad
         ]
         if other_parameters:
             parameter_groups.append(
@@ -1659,12 +1924,20 @@ class Trainer:
         return inverse.tolist()
 
     def _candidate_score(self, candidates: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        key = {
-            "coarse_peak": "coarse_peak_scores",
-            "coarse_mean": "coarse_scores",
-            "scale_peak": "peak_scores",
-            "scale_mean": "scores",
-        }[self.args.candidate_score]
+        if getattr(self.args, "ccrr_version", "v1_safe") == "v2_selective_component":
+            key = {
+                "coarse_peak": "coarse_peak_scores",
+                "coarse_mean": "coarse_mean_scores",
+                "scale_peak": "proposal_peak_scores",
+                "scale_mean": "proposal_scores",
+            }[self.args.candidate_score]
+        else:
+            key = {
+                "coarse_peak": "coarse_peak_scores",
+                "coarse_mean": "coarse_scores",
+                "scale_peak": "peak_scores",
+                "scale_mean": "scores",
+            }[self.args.candidate_score]
         if key not in candidates:
             raise KeyError(f"candidate set does not contain score field {key!r}")
         return candidates[key]
@@ -1694,9 +1967,125 @@ class Trainer:
         )
         return outputs, candidates or outputs["candidate_outputs"]
 
+    def _label_sca_candidates(
+        self, candidates: Mapping[str, torch.Tensor], labels: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Label exact action components with the public evaluation matcher."""
+
+        action_masks = candidates.get("action_masks")
+        if action_masks is None:
+            raise KeyError("SCA candidate set does not contain action_masks")
+        action_masks = action_masks.bool()
+        batch_indices = candidates["batch_indices"].to(
+            device=action_masks.device, dtype=torch.long
+        )
+        if action_masks.ndim != 3 or batch_indices.shape != (action_masks.shape[0],):
+            raise ValueError("invalid SCA action mask or batch-index shape")
+        if action_masks.shape[-2:] != labels.shape[-2:]:
+            raise ValueError("SCA action masks and GT labels must share spatial size")
+
+        count = action_masks.shape[0]
+        device = action_masks.device
+        strict_labels = torch.full(
+            (count,), CLUTTER_LABEL, dtype=torch.long, device=device
+        )
+        matched_gt_indices = torch.full(
+            (count,), -1, dtype=torch.long, device=device
+        )
+        matched_iou = torch.zeros((count,), dtype=torch.float32, device=device)
+        centroid_distance = torch.full(
+            (count,), float("inf"), dtype=torch.float32, device=device
+        )
+        quality_target = torch.zeros((count,), dtype=torch.float32, device=device)
+        ambiguous = torch.zeros((count,), dtype=torch.bool, device=device)
+        iou_weight = float(self.args.quality_iou_weight)
+        sigma = float(self.args.quality_center_sigma)
+
+        for batch_index in range(labels.shape[0]):
+            positions = torch.nonzero(
+                batch_indices == batch_index, as_tuple=False
+            ).flatten()
+            if positions.numel() == 0:
+                continue
+            prediction_array = (
+                action_masks[positions].detach().cpu().numpy().astype(bool)
+            )
+            target_array = (labels[batch_index, 0] > 0).detach().cpu().numpy()
+            component_match = match_prediction_components_to_gt(
+                prediction_array,
+                target_array,
+                center_distance=self.args.center_distance,
+            )
+            for local_index, position in enumerate(positions.tolist()):
+                is_target = bool(component_match.is_tp_component[local_index])
+                strict_labels[position] = TARGET_LABEL if is_target else CLUTTER_LABEL
+                ambiguous[position] = bool(
+                    component_match.ambiguous_keep[local_index]
+                )
+                gt_index = int(component_match.prediction_to_gt[local_index])
+                matched_gt_indices[position] = gt_index
+                if not is_target:
+                    continue
+                matched_iou[position] = float(
+                    component_match.matched_component_iou[local_index]
+                )
+                centroid_distance[position] = float(
+                    component_match.matched_centroid_distance[local_index]
+                )
+                prediction_mask = component_match.predictions.masks[local_index]
+                prediction_centroid = component_match.predictions.centroids_yx[
+                    local_index
+                ]
+                candidate_qualities = []
+                for target_mask, target_centroid in zip(
+                    component_match.targets.masks,
+                    component_match.targets.centroids_yx,
+                ):
+                    intersection = int(
+                        np.count_nonzero(prediction_mask & target_mask)
+                    )
+                    union = int(np.count_nonzero(prediction_mask | target_mask))
+                    component_iou = intersection / union if union else 0.0
+                    distance = float(
+                        np.linalg.norm(prediction_centroid - target_centroid)
+                    )
+                    center_quality = math.exp(
+                        -(distance * distance) / (2.0 * sigma * sigma)
+                    )
+                    candidate_qualities.append(
+                        iou_weight * component_iou
+                        + (1.0 - iou_weight) * center_quality
+                    )
+                quality_target[position] = max(candidate_qualities, default=0.0)
+
+        training_labels = strict_labels.clone()
+        training_labels[ambiguous] = -1
+        is_target_component = (strict_labels == TARGET_LABEL) & ~ambiguous
+        is_fp_component = (strict_labels == CLUTTER_LABEL) & ~ambiguous
+        scores = self._candidate_score(candidates).clamp(0.0, 1.0)
+        return {
+            "labels": strict_labels,
+            "strict_labels": strict_labels,
+            "training_labels": training_labels,
+            "batch_indices": batch_indices,
+            "scores": scores,
+            "sample_weights": torch.ones_like(scores),
+            "matched_gt_indices": matched_gt_indices,
+            "max_iou": matched_iou,
+            "centroid_distance": centroid_distance,
+            "center_match": strict_labels == TARGET_LABEL,
+            "target_quality_gt": quality_target,
+            "quality_valid": ~ambiguous,
+            "ambiguous_keep": ambiguous,
+            "is_target_component": is_target_component,
+            "is_fp_component": is_fp_component,
+        }
+
     def _label_candidates(
         self, candidates: Mapping[str, torch.Tensor], labels: torch.Tensor
     ) -> dict[str, torch.Tensor]:
+        if getattr(self.args, "ccrr_version", "v1_safe") == "v2_selective_component":
+            return self._label_sca_candidates(candidates, labels)
         masks = candidates.get("masks", candidates.get("candidate_masks"))
         if masks is None:
             raise KeyError("candidate set does not contain masks")
@@ -1774,13 +2163,30 @@ class Trainer:
             if state_model.ccrr is None:
                 raise RuntimeError("CCRR module is unavailable")
             state_model.ccrr.train()
+            if self.args.ccrr_version == "v2_selective_component":
+                if state_model.ccrr_feature_adapter is None:
+                    raise RuntimeError("SCA feature adapter is unavailable")
+                state_model.ccrr_feature_adapter.train()
             if self.args.ccrr_stage == "joint":
                 state_model.decoder_0.train()
                 state_model.output_0.train()
                 state_model.final.train()
-        meters = {name: AverageMeter() for name in (
-            "total", "coarse", "refined", "classification", "calibration", "preservation"
-        )}
+        meters = {
+            name: AverageMeter()
+            for name in (
+                "total",
+                "coarse",
+                "refined",
+                "classification",
+                "calibration",
+                "preservation",
+                "quality",
+                "action_risk",
+                "target_harm",
+                "missed_clutter",
+                "rank",
+            )
+        }
         maximum = self.args.max_train_batches or len(self.train_loader)
         progress = tqdm(self.train_loader, total=min(len(self.train_loader), maximum))
         warm_flag = True if self.args.enable_ccrr else epoch > self.warm_epoch
@@ -1799,30 +2205,80 @@ class Trainer:
             terms: dict[str, torch.Tensor] = {}
 
             if self.args.enable_ccrr:
-                if candidates is None or self.ccrr_loss is None:
-                    raise RuntimeError("CCRR candidate/loss state is unavailable")
+                if candidates is None:
+                    raise RuntimeError("CCRR candidate state is unavailable")
                 matching = self._label_candidates(candidates, labels)
                 refined_loss = self.loss_fun(
                     outputs["refined_logits"], labels, self.warm_epoch, epoch
                 )
-                terms = self.ccrr_loss(
-                    outputs["candidate_outputs"],
-                    matching["training_labels"],
-                    coarse_logits=outputs["coarse_logits"],
-                    refined_logits=outputs["refined_logits"],
-                    candidate_masks=outputs["candidate_outputs"]["candidate_masks"],
-                    candidate_batch_indices=outputs["candidate_outputs"]["batch_indices"],
-                    sample_weights=matching["sample_weights"],
-                )
-                total_loss = (
-                    coarse_loss
-                    + self.args.lambda_refined * refined_loss
-                    + self.args.lambda_candidate * terms["classification"]
-                    + self.args.lambda_calibration * terms["calibration"]
-                    + self.args.lambda_preservation * terms["preservation"]
-                )
+                candidate_outputs = outputs["candidate_outputs"]
+                if self.args.ccrr_version == "v2_selective_component":
+                    if any(
+                        loss is None
+                        for loss in (
+                            self.sca_clutter_loss,
+                            self.sca_quality_loss,
+                            self.sca_risk_loss,
+                            self.sca_rank_loss,
+                        )
+                    ):
+                        raise RuntimeError("SCA loss state is unavailable")
+                    classification = self.sca_clutter_loss(
+                        candidate_outputs["class_logits"],
+                        matching["training_labels"],
+                    )
+                    quality_valid = matching["quality_valid"]
+                    quality = self.sca_quality_loss(
+                        candidate_outputs["target_quality"][quality_valid],
+                        matching["target_quality_gt"][quality_valid],
+                    )
+                    risk_terms = self.sca_risk_loss(
+                        candidate_outputs["gates"],
+                        matching["is_target_component"],
+                        matching["is_fp_component"],
+                    )
+                    rank = self.sca_rank_loss(
+                        candidate_outputs["risk_score"],
+                        matching["is_target_component"],
+                        matching["is_fp_component"],
+                    )
+                    terms = {
+                        "classification": classification,
+                        "quality": quality,
+                        "action_risk": risk_terms["total"],
+                        "target_harm": risk_terms["target_harm"],
+                        "missed_clutter": risk_terms["missed_clutter"],
+                        "rank": rank,
+                    }
+                    total_loss = (
+                        coarse_loss
+                        + self.args.lambda_refined * refined_loss
+                        + self.args.lambda_clutter_cls * classification
+                        + self.args.lambda_quality * quality
+                        + self.args.lambda_action_risk * risk_terms["total"]
+                        + self.args.lambda_rank * rank
+                    )
+                else:
+                    if self.ccrr_loss is None:
+                        raise RuntimeError("CCRR loss state is unavailable")
+                    terms = self.ccrr_loss(
+                        candidate_outputs,
+                        matching["training_labels"],
+                        coarse_logits=outputs["coarse_logits"],
+                        refined_logits=outputs["refined_logits"],
+                        candidate_masks=candidate_outputs["candidate_masks"],
+                        candidate_batch_indices=candidate_outputs["batch_indices"],
+                        sample_weights=matching["sample_weights"],
+                    )
+                    total_loss = (
+                        coarse_loss
+                        + self.args.lambda_refined * refined_loss
+                        + self.args.lambda_candidate * terms["classification"]
+                        + self.args.lambda_calibration * terms["calibration"]
+                        + self.args.lambda_preservation * terms["preservation"]
+                    )
                 meters["refined"].update(refined_loss.item(), images.shape[0])
-                for name in ("classification", "calibration", "preservation"):
+                for name in terms:
                     meters[name].update(terms[name].item(), images.shape[0])
 
             self.optimizer.zero_grad(set_to_none=True)
@@ -1922,7 +2378,9 @@ class Trainer:
 
                     batch_indices_tensor = matching["batch_indices"]
                     candidate_masks_tensor = candidate_outputs[
-                        "candidate_masks"
+                        "action_masks"
+                        if self.args.ccrr_version == "v2_selective_component"
+                        else "candidate_masks"
                     ].bool()
                     coarse_candidate_probabilities = outputs[
                         "coarse_logits"
@@ -1963,7 +2421,11 @@ class Trainer:
                             "image": image_name,
                             "candidate_id": candidate_id,
                             "strict_label": LABEL_NAMES[int(strict_labels[index])],
-                            "training_label": LABEL_NAMES[int(train_labels[index])],
+                            "training_label": (
+                                "keep_ignore"
+                                if int(train_labels[index]) == -1
+                                else LABEL_NAMES[int(train_labels[index])]
+                            ),
                             "raw_peak": float(coarse_peaks[index].item()),
                             "raw_mean": float(coarse_means[index].item()),
                             "target_prob": float(probs[index, TARGET_LABEL]),
@@ -1973,7 +2435,69 @@ class Trainer:
                             "coarse_detected": coarse_detected,
                             "refined_detected": refined_detected,
                         }
-                        if self.args.ccrr_version == "v1_threshold_aware":
+                        if self.args.ccrr_version == "v2_selective_component":
+                            record.update(
+                                {
+                                    "proposal_id": int(
+                                        candidate_outputs[
+                                            "proposal_component_ids"
+                                        ][index].item()
+                                    ),
+                                    "action_component_id": int(
+                                        candidate_outputs[
+                                            "action_component_local_ids"
+                                        ][index].item()
+                                    ),
+                                    "proposal_to_component_iou": float(
+                                        candidate_outputs[
+                                            "proposal_to_action_iou"
+                                        ][index].item()
+                                    ),
+                                    "proposal_is_fallback": bool(
+                                        candidate_outputs[
+                                            "proposal_is_fallback"
+                                        ][index].item()
+                                    ),
+                                    "action_area": int(
+                                        candidate_outputs["action_areas"][
+                                            index
+                                        ].item()
+                                    ),
+                                    "proposal_area": int(
+                                        candidate_outputs["proposal_areas"][
+                                            index
+                                        ].item()
+                                    ),
+                                    "matched_gt_id": int(
+                                        matching["matched_gt_indices"][
+                                            index
+                                        ].item()
+                                    ),
+                                    "target_quality": float(
+                                        candidate_outputs["target_quality"][
+                                            index
+                                        ].item()
+                                    ),
+                                    "target_quality_gt": float(
+                                        matching["target_quality_gt"][index].item()
+                                    ),
+                                    "risk_score": float(
+                                        candidate_outputs["risk_score"][index].item()
+                                    ),
+                                    "quality_veto": bool(
+                                        candidate_outputs["quality_veto"][
+                                            index
+                                        ].item()
+                                    ),
+                                    "ambiguous_keep": bool(
+                                        matching["ambiguous_keep"][index].item()
+                                    ),
+                                }
+                            )
+                        if self.args.ccrr_version in (
+                            "v1_threshold_aware",
+                            "v2_selective_component",
+                        ):
                             positive_support = (
                                 candidate_masks_tensor[index]
                                 & (coarse_candidate_probabilities[index] > 0.5)
@@ -2007,10 +2531,37 @@ class Trainer:
                                         and not refined_positive_support.any().item()
                                     ),
                                     "is_target": bool(
-                                        train_labels[index] == TARGET_LABEL
+                                        strict_labels[index] == TARGET_LABEL
+                                        if self.args.ccrr_version
+                                        == "v2_selective_component"
+                                        else train_labels[index]
+                                        == TARGET_LABEL
                                     ),
                                     "is_clutter": bool(
-                                        train_labels[index] == CLUTTER_LABEL
+                                        strict_labels[index] == CLUTTER_LABEL
+                                        if self.args.ccrr_version
+                                        == "v2_selective_component"
+                                        else train_labels[index]
+                                        == CLUTTER_LABEL
+                                    ),
+                                    "is_ambiguous": bool(
+                                        self.args.ccrr_version
+                                        == "v2_selective_component"
+                                        and train_labels[index] == -1
+                                    ),
+                                    "component_eliminated": bool(
+                                        coarse_detected and not refined_detected
+                                    ),
+                                    "target_component_eliminated": bool(
+                                        (
+                                            strict_labels[index]
+                                            if self.args.ccrr_version
+                                            == "v2_selective_component"
+                                            else train_labels[index]
+                                        )
+                                        == TARGET_LABEL
+                                        and coarse_detected
+                                        and not refined_detected
                                     ),
                                 }
                             )
@@ -2270,8 +2821,11 @@ class Trainer:
                     else np.empty((0,), dtype=np.int64),
                     (
                         None
-                        if self.args.ccrr_version == "v1_threshold_aware"
-                        and self.args.max_action_suppression == 0
+                        if self.args.ccrr_version == "v2_selective_component"
+                        or (
+                            self.args.ccrr_version == "v1_threshold_aware"
+                            and self.args.max_action_suppression == 0
+                        )
                         else self.args.max_action_suppression
                         if self.args.ccrr_version == "v1_threshold_aware"
                         else self.args.max_delta
@@ -2300,7 +2854,10 @@ class Trainer:
                     },
                 },
             }
-            if self.args.ccrr_version == "v1_threshold_aware":
+            if self.args.ccrr_version in (
+                "v1_threshold_aware",
+                "v2_selective_component",
+            ):
                 actions = [
                     record
                     for record in candidate_records
@@ -2315,6 +2872,9 @@ class Trainer:
                 target_actions = [
                     record for record in actions if record["is_target"]
                 ]
+                ambiguous_actions = [
+                    record for record in actions if record["is_ambiguous"]
+                ]
                 crossed_actions = [
                     record
                     for record in coarse_positive_actions
@@ -2325,6 +2885,16 @@ class Trainer:
                     for record in coarse_positive_actions
                     if record["candidate_positive_support_eliminated"]
                 ]
+                eliminated_clutter = [
+                    record
+                    for record in clutter_actions
+                    if record["component_eliminated"]
+                ]
+                eliminated_target = [
+                    record
+                    for record in target_actions
+                    if record["target_component_eliminated"]
+                ]
 
                 def action_ratio(numerator: int, denominator: int) -> float:
                     return (
@@ -2333,9 +2903,26 @@ class Trainer:
                         else float("nan")
                     )
 
-                metrics["candidate"]["action_operating_point"] = {
-                    "clutter_action_threshold": float(
-                        self.args.clutter_action_threshold
+                action_operating_point = {
+                    "action_score": (
+                        "selective_risk"
+                        if self.args.ccrr_version == "v2_selective_component"
+                        else "clutter_probability"
+                    ),
+                    "clutter_action_threshold": (
+                        None
+                        if self.args.ccrr_version == "v2_selective_component"
+                        else float(self.args.clutter_action_threshold)
+                    ),
+                    "risk_threshold": (
+                        float(self.args.risk_threshold)
+                        if self.args.ccrr_version == "v2_selective_component"
+                        else None
+                    ),
+                    "quality_veto_threshold": (
+                        float(self.args.quality_veto_threshold)
+                        if self.args.ccrr_version == "v2_selective_component"
+                        else None
                     ),
                     "remove_threshold": float(
                         self.args.clutter_peak_ceiling
@@ -2343,6 +2930,12 @@ class Trainer:
                     "num_actions": len(actions),
                     "num_clutter_actions": len(clutter_actions),
                     "num_target_actions": len(target_actions),
+                    "num_ambiguous_actions": len(ambiguous_actions),
+                    "num_eliminated_fp_components": len(eliminated_clutter),
+                    "num_eliminated_target_components": len(eliminated_target),
+                    "fp_component_removal_efficiency": action_ratio(
+                        len(eliminated_clutter), len(clutter_actions)
+                    ),
                     "action_precision": action_ratio(
                         len(clutter_actions), len(actions)
                     ),
@@ -2367,6 +2960,71 @@ class Trainer:
                     ),
                     "component_transitions": dict(detection_transitions),
                 }
+                metrics["candidate"]["action_operating_point"] = (
+                    action_operating_point
+                )
+                if self.args.ccrr_version == "v2_selective_component":
+                    coarse_fppi = float(coarse_summary["FPPI"])
+                    coarse_fa = float(
+                        coarse_summary["Fa_per_million_pixels"]
+                    )
+                    relative_fppi_reduction = (
+                        (coarse_fppi - float(refined_summary["FPPI"]))
+                        / coarse_fppi
+                        if coarse_fppi > 0
+                        else 0.0
+                    )
+                    relative_fa_reduction = (
+                        (
+                            coarse_fa
+                            - float(
+                                refined_summary["Fa_per_million_pixels"]
+                            )
+                        )
+                        / coarse_fa
+                        if coarse_fa > 0
+                        else 0.0
+                    )
+                    tolerance = 1e-12
+                    sca_gate = {
+                        "target_deletion_zero": len(eliminated_target) == 0,
+                        "action_precision_at_least_0_90": (
+                            len(actions) > 0
+                            and len(clutter_actions) / len(actions) >= 0.90
+                        ),
+                        "fp_removal_efficiency_at_least_0_90": (
+                            len(clutter_actions) > 0
+                            and len(eliminated_clutter) / len(clutter_actions)
+                            >= 0.90
+                        ),
+                        "fppi_relative_reduction_at_least_0_15": (
+                            relative_fppi_reduction >= 0.15
+                        ),
+                        "fa_relative_reduction_at_least_0_10": (
+                            relative_fa_reduction >= 0.10
+                        ),
+                        "pd_not_below_coarse": (
+                            float(refined_summary["Pd"])
+                            + tolerance
+                            >= float(coarse_summary["Pd"])
+                        ),
+                        "miou_not_below_coarse": (
+                            float(refined_summary["mIoU"])
+                            + tolerance
+                            >= float(coarse_summary["mIoU"])
+                        ),
+                        "niou_not_below_coarse": (
+                            float(refined_summary["nIoU"])
+                            + tolerance
+                            >= float(coarse_summary["nIoU"])
+                        ),
+                    }
+                    sca_gate["go"] = all(sca_gate.values())
+                    metrics["candidate"]["sca_gate"] = {
+                        **sca_gate,
+                        "relative_fppi_reduction": relative_fppi_reduction,
+                        "relative_fa_reduction": relative_fa_reduction,
+                    }
 
         if self.mode == "train" and select_weights:
             score_key = "refined" if self.args.enable_ccrr else "coarse"
