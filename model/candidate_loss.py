@@ -202,6 +202,103 @@ class CandidateClassificationLoss(nn.Module):
         )
 
 
+class CandidateBinaryFocalLoss(nn.Module):
+    """Class-balanced focal BCE for binary target/clutter supervision.
+
+    Class ``1`` is the clutter/action-positive class.  Under ``mean``
+    reduction, target and clutter are normalized within class before their
+    alpha-weighted terms are added, so a rare clutter class is not diluted by
+    the much larger target set.
+    """
+
+    def __init__(
+        self,
+        *,
+        gamma: float = 2.0,
+        positive_alpha: float = 0.75,
+        ignore_index: int = -1,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        _validate_reduction(reduction)
+        if gamma < 0:
+            raise ValueError("gamma must be non-negative")
+        if not 0.0 <= positive_alpha <= 1.0:
+            raise ValueError("positive_alpha must lie in [0,1]")
+        self.gamma = float(gamma)
+        self.positive_alpha = float(positive_alpha)
+        self.ignore_index = int(ignore_index)
+        self.reduction = reduction
+
+    def forward(
+        self,
+        class_logits: Tensor,
+        labels: Tensor,
+        sample_weights: Tensor | None = None,
+    ) -> Tensor:
+        if class_logits.ndim != 2 or class_logits.shape[1] != 2:
+            raise ValueError("binary focal loss requires class_logits with shape [N,2]")
+        labels = _as_class_labels(labels, 2).to(class_logits.device)
+        if labels.shape[0] != class_logits.shape[0]:
+            raise ValueError("class_logits and labels disagree on candidate count")
+        valid = labels != self.ignore_index
+        if valid.any() and ((labels[valid] < 0).any() or (labels[valid] > 1).any()):
+            raise ValueError("labels must be 0, 1, or ignore_index")
+        if not valid.any():
+            if self.reduction == "none":
+                return class_logits.new_zeros(labels.shape) + _zero_loss(class_logits)
+            return _zero_loss(class_logits)
+
+        weights = valid.to(dtype=class_logits.dtype)
+        if sample_weights is not None:
+            supplied = torch.as_tensor(
+                sample_weights,
+                device=class_logits.device,
+                dtype=class_logits.dtype,
+            )
+            if supplied.ndim != 1 or supplied.shape[0] != labels.shape[0]:
+                raise ValueError("sample_weights must have shape [N]")
+            if not torch.isfinite(supplied).all() or (supplied < 0).any():
+                raise ValueError("sample_weights must be finite and non-negative")
+            weights = weights * supplied
+
+        safe_labels = labels.clamp(0, 1).to(dtype=class_logits.dtype)
+        binary_logits = class_logits[:, 1] - class_logits[:, 0]
+        bce = F.binary_cross_entropy_with_logits(
+            binary_logits, safe_labels, reduction="none"
+        )
+        clutter_probability = binary_logits.sigmoid()
+        probability_of_label = torch.where(
+            safe_labels > 0.5, clutter_probability, 1.0 - clutter_probability
+        )
+        alpha = torch.where(
+            safe_labels > 0.5,
+            class_logits.new_tensor(self.positive_alpha),
+            class_logits.new_tensor(1.0 - self.positive_alpha),
+        )
+        per_candidate = (
+            alpha
+            * (1.0 - probability_of_label).pow(self.gamma)
+            * bce
+            * weights
+        )
+        if self.reduction == "none":
+            return per_candidate
+        if self.reduction == "sum":
+            return per_candidate.sum()
+
+        target_mask = valid & (labels == 0)
+        clutter_mask = valid & (labels == 1)
+        loss = _zero_loss(class_logits)
+        if target_mask.any():
+            denominator = weights[target_mask].sum().clamp_min(1e-6)
+            loss = loss + per_candidate[target_mask].sum() / denominator
+        if clutter_mask.any():
+            denominator = weights[clutter_mask].sum().clamp_min(1e-6)
+            loss = loss + per_candidate[clutter_mask].sum() / denominator
+        return loss
+
+
 class CandidateBrierLoss(nn.Module):
     """Multiclass Brier loss for candidate reliability calibration.
 
@@ -493,6 +590,9 @@ class CCRRLoss(nn.Module):
         classification_weight: float = 1.0,
         calibration_weight: float = 1.0,
         preservation_weight: float = 1.0,
+        classification_mode: str = "cross_entropy",
+        focal_gamma: float = 2.0,
+        focal_positive_alpha: float = 0.75,
     ) -> None:
         super().__init__()
         for name, value in (
@@ -503,11 +603,28 @@ class CCRRLoss(nn.Module):
             if value < 0:
                 raise ValueError(f"{name} must be non-negative")
 
-        self.classification = CandidateClassificationLoss(
-            class_weights,
-            ignore_index=ignore_index,
-            label_smoothing=label_smoothing,
-        )
+        if classification_mode == "cross_entropy":
+            self.classification = CandidateClassificationLoss(
+                class_weights,
+                ignore_index=ignore_index,
+                label_smoothing=label_smoothing,
+            )
+        elif classification_mode == "binary_focal":
+            if class_weights is not None:
+                raise ValueError(
+                    "binary focal classification uses focal_positive_alpha and "
+                    "within-class normalization; class_weights must be None"
+                )
+            self.classification = CandidateBinaryFocalLoss(
+                gamma=focal_gamma,
+                positive_alpha=focal_positive_alpha,
+                ignore_index=ignore_index,
+            )
+        else:
+            raise ValueError(
+                "classification_mode must be 'cross_entropy' or 'binary_focal'"
+            )
+        self.classification_mode = classification_mode
         self.calibration = CandidateBrierLoss(
             from_logits=True,
             ignore_index=ignore_index,
@@ -604,6 +721,7 @@ class CCRRLoss(nn.Module):
 
 __all__ = [
     "CandidateClassificationLoss",
+    "CandidateBinaryFocalLoss",
     "CandidateBrierLoss",
     "RectificationPreservationLoss",
     "CCRRLoss",

@@ -22,6 +22,7 @@ from typing import Any, Mapping
 
 import numpy as np
 from skimage.measure import label as connected_components
+from skimage.measure import regionprops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,7 +42,7 @@ from utils.candidate import (
     match_candidates_to_gt,
 )
 from utils.data import IRSTD_Dataset
-from utils.detection_metric import SegmentationFROC
+from utils.detection_metric import SegmentationFROC, maximum_centroid_pairs
 from utils.metric import PD_FA
 from utils.reliability_metric import (
     candidate_brier_score,
@@ -106,6 +107,15 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ccrr-stage", choices=("head_only", "joint"), default="head_only"
     )
+    parser.add_argument(
+        "--ccrr-version",
+        choices=("v1_safe", "v1_threshold_aware"),
+        default="v1_safe",
+        help=(
+            "Keep v1_safe for exact historical reproduction; use "
+            "v1_threshold_aware for the audited V1.1 action executor."
+        ),
+    )
     parser.add_argument("--candidate-bank", default="")
     parser.add_argument("--test-candidate-bank", default="")
     parser.add_argument("--candidate-threshold", type=float, default=0.2)
@@ -132,6 +142,20 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--gate-margin", type=float, default=0.5)
     parser.add_argument("--gate-temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--clutter-action-threshold",
+        "--action-threshold",
+        dest="clutter_action_threshold",
+        type=float,
+        default=0.90,
+    )
+    parser.add_argument("--action-temperature", type=float, default=0.05)
+    parser.add_argument(
+        "--max-action-suppression",
+        type=float,
+        default=0.0,
+        help="V1.1 action cap in logits; 0 uses the audited exact/unbounded correction.",
+    )
     parser.add_argument("--ccrr-num-classes", type=int, choices=(2, 3), default=2)
     parser.add_argument("--ccrr-lr", type=float, default=3e-4)
     parser.add_argument("--backbone-lr", type=float, default=1e-4)
@@ -141,14 +165,28 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     parser.add_argument("--lambda-refined", type=float, default=0.5)
     parser.add_argument("--lambda-candidate", type=float, default=1.0)
     parser.add_argument("--lambda-calibration", type=float, default=0.05)
-    parser.add_argument("--lambda-preservation", type=float, default=1.0)
+    parser.add_argument(
+        "--lambda-preservation",
+        "--lambda-action",
+        dest="lambda_preservation",
+        type=float,
+        default=1.0,
+    )
     parser.add_argument("--clutter-margin", type=float, default=0.1)
     parser.add_argument("--easy-negative-weight", type=float, default=0.5)
     parser.add_argument("--hard-negative-weight", type=float, default=2.0)
     parser.add_argument("--hardness-gamma", type=float, default=2.0)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--clutter-focal-gamma", type=float, default=2.0)
+    parser.add_argument("--clutter-positive-alpha", type=float, default=0.75)
     parser.add_argument("--target-allowed-peak-drop", type=float, default=0.01)
-    parser.add_argument("--clutter-peak-ceiling", type=float, default=0.45)
+    parser.add_argument(
+        "--clutter-peak-ceiling",
+        "--remove-threshold",
+        dest="clutter_peak_ceiling",
+        type=float,
+        default=0.45,
+    )
     parser.add_argument(
         "--candidate-class-weights",
         type=float,
@@ -280,7 +318,7 @@ def _binary_candidate_metrics(
 def _delta_statistics(
     deltas: np.ndarray,
     labels: np.ndarray,
-    max_suppression: float,
+    max_suppression: float | None,
 ) -> dict[str, Any]:
     deltas = np.asarray(deltas, dtype=np.float64)
     labels = np.asarray(labels, dtype=np.int64)
@@ -289,7 +327,7 @@ def _delta_statistics(
         values = deltas[mask]
         if values.size == 0:
             return {"count": 0}
-        return {
+        summary = {
             "count": int(values.size),
             "mean": float(values.mean()),
             "median": float(np.median(values)),
@@ -297,10 +335,17 @@ def _delta_statistics(
             "max": float(values.max()),
             "positive_fraction": float(np.mean(values > 1e-8)),
             "negative_fraction": float(np.mean(values < -1e-8)),
-            "saturation_fraction": float(
-                np.mean(np.isclose(np.abs(values), max_suppression, atol=1e-5))
-            ),
         }
+        summary["saturation_fraction"] = (
+            float(
+                np.mean(
+                    np.isclose(np.abs(values), max_suppression, atol=1e-5)
+                )
+            )
+            if max_suppression is not None
+            else None
+        )
+        return summary
 
     target = one_class(labels == TARGET_LABEL)
     clutter = one_class(labels == CLUTTER_LABEL)
@@ -347,37 +392,37 @@ def _detection_transition_counts(
         gt_centroids = centroids(gt_labels)
         coarse_centroids = centroids(coarse_labels)
         refined_centroids = centroids(refined_labels)
+        coarse_pairs = maximum_centroid_pairs(
+            gt_centroids, coarse_centroids, float(center_distance)
+        )
+        refined_pairs = maximum_centroid_pairs(
+            gt_centroids, refined_centroids, float(center_distance)
+        )
+        coarse_detected = {gt_index for gt_index, _ in coarse_pairs}
+        refined_detected = {gt_index for gt_index, _ in refined_pairs}
+        totals["coarse_detected_refined_missed_targets"] += len(
+            coarse_detected - refined_detected
+        )
+        totals["coarse_missed_refined_detected_targets"] += len(
+            refined_detected - coarse_detected
+        )
 
-        def detected(gt: np.ndarray, predictions: list[np.ndarray]) -> bool:
-            return any(
-                np.linalg.norm(prediction - gt) <= float(center_distance)
-                for prediction in predictions
-            )
-
-        for gt in gt_centroids:
-            coarse_hit = detected(gt, coarse_centroids)
-            refined_hit = detected(gt, refined_centroids)
-            totals["coarse_detected_refined_missed_targets"] += int(
-                coarse_hit and not refined_hit
-            )
-            totals["coarse_missed_refined_detected_targets"] += int(
-                refined_hit and not coarse_hit
-            )
-
-        def false_positive_ids(
-            component_map: np.ndarray, predictions: list[np.ndarray]
-        ) -> list[int]:
-            return [
-                index
-                for index, prediction in enumerate(predictions, start=1)
-                if not any(
-                    np.linalg.norm(prediction - gt) <= float(center_distance)
-                    for gt in gt_centroids
-                )
-            ]
-
-        coarse_fp = false_positive_ids(coarse_labels, coarse_centroids)
-        refined_fp = false_positive_ids(refined_labels, refined_centroids)
+        coarse_matched_predictions = {
+            prediction_index for _, prediction_index in coarse_pairs
+        }
+        refined_matched_predictions = {
+            prediction_index for _, prediction_index in refined_pairs
+        }
+        coarse_fp = [
+            prediction_index + 1
+            for prediction_index in range(len(coarse_centroids))
+            if prediction_index not in coarse_matched_predictions
+        ]
+        refined_fp = [
+            prediction_index + 1
+            for prediction_index in range(len(refined_centroids))
+            if prediction_index not in refined_matched_predictions
+        ]
         totals["eliminated_fp_components"] += sum(
             not any(
                 np.any((coarse_labels == coarse_id) & (refined_labels == refined_id))
@@ -601,16 +646,31 @@ class CandidateBank:
 class DetectionMetrics:
     """Original MSHNet metrics at its zero-logit (probability 0.5) threshold."""
 
-    def __init__(self, image_size: int) -> None:
+    def __init__(self, image_size: int, center_distance: float = 3.0) -> None:
         self.pd_fa = PD_FA(1, 10, image_size)
+        self.center_distance = float(center_distance)
         self.total_intersection = 0
         self.total_union = 0
+        self.total_prediction_pixels = 0
+        self.total_target_pixels = 0
+        self.true_positives = 0
+        self.false_positives = 0
+        self.num_targets = 0
+        self.matched_iou_sum = 0.0
+        self.matched_iou_count = 0
         self.per_image_iou: list[float] = []
 
     def reset(self) -> None:
         self.pd_fa.reset()
         self.total_intersection = 0
         self.total_union = 0
+        self.total_prediction_pixels = 0
+        self.total_target_pixels = 0
+        self.true_positives = 0
+        self.false_positives = 0
+        self.num_targets = 0
+        self.matched_iou_sum = 0.0
+        self.matched_iou_count = 0
         self.per_image_iou.clear()
 
     def update(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
@@ -622,7 +682,38 @@ class DetectionMetrics:
         union = int((prediction | target).sum().item())
         self.total_intersection += intersection
         self.total_union += union
+        self.total_prediction_pixels += int(prediction.sum().item())
+        self.total_target_pixels += int(target.sum().item())
         self.per_image_iou.append(intersection / union if union else 1.0)
+        prediction_map = prediction[0, 0].detach().cpu().numpy()
+        target_map = target[0, 0].detach().cpu().numpy()
+        prediction_labels = connected_components(prediction_map, connectivity=2)
+        target_labels = connected_components(target_map, connectivity=2)
+        prediction_regions = regionprops(prediction_labels)
+        target_regions = regionprops(target_labels)
+        pairs = maximum_centroid_pairs(
+            [np.asarray(region.centroid) for region in target_regions],
+            [np.asarray(region.centroid) for region in prediction_regions],
+            self.center_distance,
+        )
+        self.num_targets += len(target_regions)
+        self.true_positives += len(pairs)
+        self.false_positives += len(prediction_regions) - len(pairs)
+        for target_index, prediction_index in pairs:
+            target_component = target_labels == target_regions[target_index].label
+            prediction_component = (
+                prediction_labels == prediction_regions[prediction_index].label
+            )
+            component_intersection = int(
+                np.count_nonzero(target_component & prediction_component)
+            )
+            component_union = int(
+                np.count_nonzero(target_component | prediction_component)
+            )
+            self.matched_iou_sum += (
+                component_intersection / component_union if component_union else 1.0
+            )
+            self.matched_iou_count += 1
         self.pd_fa.update(logits, labels)
 
     @property
@@ -635,11 +726,51 @@ class DetectionMetrics:
 
     def get(self, num_images: int) -> dict[str, float]:
         false_alarm, detection_probability = self.pd_fa.get(num_images)
+        pixel_precision = (
+            self.total_intersection / self.total_prediction_pixels
+            if self.total_prediction_pixels
+            else float("nan")
+        )
+        pixel_recall = (
+            self.total_intersection / self.total_target_pixels
+            if self.total_target_pixels
+            else float("nan")
+        )
+        object_precision = (
+            self.true_positives / (self.true_positives + self.false_positives)
+            if self.true_positives + self.false_positives
+            else float("nan")
+        )
+        object_recall = (
+            self.true_positives / self.num_targets
+            if self.num_targets
+            else float("nan")
+        )
         return {
             "mIoU": float(self.mean_iou),
             "nIoU": float(np.mean(self.per_image_iou)),
             "Pd": float(detection_probability[0]),
             "Fa_per_million_pixels": float(false_alarm[0] * 1_000_000),
+            "pixel_precision": float(pixel_precision),
+            "pixel_recall": float(pixel_recall),
+            "pixel_f1": float(
+                2.0 * pixel_precision * pixel_recall
+                / (pixel_precision + pixel_recall)
+                if pixel_precision + pixel_recall > 0
+                else float("nan")
+            ),
+            "object_precision": float(object_precision),
+            "object_f1": float(
+                2.0 * object_precision * object_recall
+                / (object_precision + object_recall)
+                if object_precision + object_recall > 0
+                else float("nan")
+            ),
+            "matched_target_iou": float(
+                self.matched_iou_sum / self.matched_iou_count
+                if self.matched_iou_count
+                else float("nan")
+            ),
         }
 
 
@@ -733,6 +864,21 @@ class Trainer:
                 "gate_temperature": args.gate_temperature,
                 "num_classes": args.ccrr_num_classes,
             }
+            if args.ccrr_version == "v1_threshold_aware":
+                ccrr_config.update(
+                    {
+                        "rectifier": "threshold_aware",
+                        "action_threshold": args.clutter_action_threshold,
+                        "remove_threshold": args.clutter_peak_ceiling,
+                        "action_temperature": args.action_temperature,
+                        "max_suppression": (
+                            args.max_action_suppression
+                            if args.max_action_suppression > 0
+                            else None
+                        ),
+                        "output_threshold": 0.5,
+                    }
+                )
         model: nn.Module = MSHNet(3, ccrr_config=ccrr_config)
         if args.multi_gpus:
             if args.enable_ccrr:
@@ -747,14 +893,19 @@ class Trainer:
         self.loss_fun = SLSIoULoss()
         self.ccrr_loss: CCRRLoss | None = None
         if args.enable_ccrr:
-            class_weights = self._resolve_candidate_class_weights()
-            if len(class_weights) != args.ccrr_num_classes:
-                if args.ccrr_num_classes == 3 and len(class_weights) == 2:
-                    class_weights.append(0.0)
-                else:
-                    raise ValueError(
-                        "--candidate-class-weights must have one value per CCRR class"
-                    )
+            if args.ccrr_version == "v1_threshold_aware":
+                class_weights = None
+                resolved_class_weights: list[float] = []
+            else:
+                class_weights = self._resolve_candidate_class_weights()
+                if len(class_weights) != args.ccrr_num_classes:
+                    if args.ccrr_num_classes == 3 and len(class_weights) == 2:
+                        class_weights.append(0.0)
+                    else:
+                        raise ValueError(
+                            "--candidate-class-weights must have one value per CCRR class"
+                        )
+                resolved_class_weights = class_weights
             self.ccrr_loss = CCRRLoss(
                 class_weights=class_weights,
                 ignore_index=-1,
@@ -765,8 +916,15 @@ class Trainer:
                 classification_weight=1.0,
                 calibration_weight=1.0,
                 preservation_weight=1.0,
+                classification_mode=(
+                    "binary_focal"
+                    if args.ccrr_version == "v1_threshold_aware"
+                    else "cross_entropy"
+                ),
+                focal_gamma=args.clutter_focal_gamma,
+                focal_positive_alpha=args.clutter_positive_alpha,
             )
-            args.resolved_candidate_class_weights = class_weights
+            args.resolved_candidate_class_weights = resolved_class_weights
 
         self.save_folder = self._new_save_folder()
         if args.mode == "train":
@@ -824,6 +982,12 @@ class Trainer:
             raise ValueError("--max-delta/--max-suppression must be non-negative")
         if self.args.gate_temperature <= 0:
             raise ValueError("--gate-temperature must be positive")
+        if not 0.5 < self.args.clutter_action_threshold < 1.0:
+            raise ValueError("--clutter-action-threshold must lie in (0.5, 1)")
+        if self.args.action_temperature <= 0:
+            raise ValueError("--action-temperature must be positive")
+        if self.args.max_action_suppression < 0:
+            raise ValueError("--max-action-suppression must be non-negative")
         if self.args.easy_negative_weight < 0 or self.args.hard_negative_weight < 0:
             raise ValueError("negative sample weights must be non-negative")
         if self.args.hard_negative_weight < self.args.easy_negative_weight:
@@ -832,10 +996,31 @@ class Trainer:
             raise ValueError("--hardness-gamma must be non-negative")
         if not 0.0 <= self.args.label_smoothing <= 1.0:
             raise ValueError("--label-smoothing must lie in [0, 1]")
+        if self.args.clutter_focal_gamma < 0:
+            raise ValueError("--clutter-focal-gamma must be non-negative")
+        if not 0.0 <= self.args.clutter_positive_alpha <= 1.0:
+            raise ValueError("--clutter-positive-alpha must lie in [0, 1]")
         if not 0.0 <= self.args.target_allowed_peak_drop <= 1.0:
             raise ValueError("--target-allowed-peak-drop must lie in [0, 1]")
         if not 0.0 <= self.args.clutter_peak_ceiling <= 1.0:
             raise ValueError("--clutter-peak-ceiling must lie in [0, 1]")
+        if self.args.enable_ccrr and self.args.ccrr_version == "v1_threshold_aware":
+            if self.args.ccrr_num_classes != 2:
+                raise ValueError("v1_threshold_aware requires --ccrr-num-classes 2")
+            if self.args.candidate_class_weights is not None:
+                raise ValueError(
+                    "v1_threshold_aware uses class-balanced focal loss; omit "
+                    "--candidate-class-weights and tune --clutter-positive-alpha"
+                )
+            if not 0.0 < self.args.clutter_peak_ceiling < 0.5:
+                raise ValueError(
+                    "v1_threshold_aware requires --clutter-peak-ceiling in (0, 0.5)"
+                )
+            if self.args.candidate_bank or self.args.test_candidate_bank:
+                raise ValueError(
+                    "v1_threshold_aware uses online candidates; omit "
+                    "--candidate-bank and --test-candidate-bank"
+                )
         if (
             self.args.mode == "train"
             and self.args.enable_ccrr
@@ -921,6 +1106,28 @@ class Trainer:
                     "ccrr_num_classes": int(self.args.ccrr_num_classes),
                 }
             )
+            if self.args.ccrr_version == "v1_threshold_aware":
+                config.update(
+                    {
+                        "ccrr_version": "v1_threshold_aware",
+                        "rectifier": "threshold_aware",
+                        "clutter_action_threshold": float(
+                            self.args.clutter_action_threshold
+                        ),
+                        "remove_threshold": float(
+                            self.args.clutter_peak_ceiling
+                        ),
+                        "action_temperature": float(
+                            self.args.action_temperature
+                        ),
+                        "max_action_suppression": (
+                            float(self.args.max_action_suppression)
+                            if self.args.max_action_suppression > 0
+                            else None
+                        ),
+                        "output_probability_threshold": 0.5,
+                    }
+                )
         return config
 
     def _evaluation_config(self) -> dict[str, Any]:
@@ -945,6 +1152,20 @@ class Trainer:
                     "positive_iou": float(self.args.positive_iou),
                 }
             )
+            if self.args.ccrr_version == "v1_threshold_aware":
+                test_source = self.test_loader.dataset
+                if isinstance(test_source, Data.Subset):
+                    test_source = test_source.dataset
+                config.update(
+                    {
+                        "validation_source": None,
+                        "development_selection_source": "official_test",
+                        "max_test_batches": int(self.args.max_test_batches),
+                        "raw_test_split_sha256": _file_sha256(
+                            Path(test_source.list_dir)
+                        ),
+                    }
+                )
         return config
 
     def _training_config(self) -> dict[str, Any]:
@@ -995,6 +1216,38 @@ class Trainer:
                     "test_start_epoch": int(self.args.test_start_epoch),
                 }
             )
+            if self.args.ccrr_version == "v1_threshold_aware":
+                train_source = (
+                    self.train_loader.dataset
+                    if self.train_loader is not None
+                    else None
+                )
+                if isinstance(train_source, Data.Subset):
+                    train_source = train_source.dataset
+                config.update(
+                    {
+                        "ccrr_version": "v1_threshold_aware",
+                        "classification_loss": "class_balanced_binary_focal",
+                        "label_smoothing": None,
+                        "clutter_focal_gamma": float(
+                            self.args.clutter_focal_gamma
+                        ),
+                        "clutter_positive_alpha": float(
+                            self.args.clutter_positive_alpha
+                        ),
+                        "action_loss": "threshold_crossing_and_target_keep",
+                        "action_probability_threshold": float(
+                            self.args.clutter_action_threshold
+                        ),
+                        "max_train_batches": int(self.args.max_train_batches),
+                        "num_workers": int(self.args.num_workers),
+                        "raw_train_split_sha256": (
+                            _file_sha256(Path(train_source.list_dir))
+                            if train_source is not None
+                            else None
+                        ),
+                    }
+                )
         return config
 
     @staticmethod
@@ -1294,7 +1547,15 @@ class Trainer:
 
     def _new_save_folder(self) -> str:
         dataset = Path(self.args.dataset_dir).name
-        variant = "ccrr-" + self.args.ccrr_stage if self.args.enable_ccrr else "baseline"
+        if self.args.enable_ccrr:
+            version = (
+                ""
+                if self.args.ccrr_version == "v1_safe"
+                else f"{self.args.ccrr_version}-"
+            )
+            variant = f"ccrr-{version}{self.args.ccrr_stage}"
+        else:
+            variant = "baseline"
         stamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
         folder = osp.join(self.args.save_dir, f"{dataset}-{variant}-{stamp}")
         if self.args.mode == "train" and not self.args.if_checkpoint:
@@ -1589,8 +1850,12 @@ class Trainer:
         max_batches = self.args.max_test_batches
         select_weights = self.mode == "train"
         self.model.eval()
-        coarse_metrics = DetectionMetrics(self.args.base_size)
-        refined_metrics = DetectionMetrics(self.args.base_size)
+        coarse_metrics = DetectionMetrics(
+            self.args.base_size, self.args.center_distance
+        )
+        refined_metrics = DetectionMetrics(
+            self.args.base_size, self.args.center_distance
+        )
         froc_thresholds = np.unique(
             np.concatenate(
                 (np.linspace(1.0, 0.0, self.args.froc_bins + 1), np.asarray([0.5]))
@@ -1681,6 +1946,9 @@ class Trainer:
                         gates_tensor = candidate_outputs.get("gate")
                     if gates_tensor is None:
                         gates_tensor = torch.zeros_like(deltas_tensor)
+                    required_deltas_tensor = candidate_outputs.get(
+                        "required_deltas", deltas_tensor
+                    ).detach()
                     delta_values.append(deltas_tensor.cpu().numpy())
                     delta_labels.append(train_labels)
 
@@ -1689,26 +1957,64 @@ class Trainer:
                         image_name = names[int(batch_indices_np[index])]
                         candidate_id = per_image_candidate_ids[image_name]
                         per_image_candidate_ids[image_name] += 1
-                        candidate_records.append(
-                            {
-                                "image": image_name,
-                                "candidate_id": candidate_id,
-                                "strict_label": LABEL_NAMES[int(strict_labels[index])],
-                                "training_label": LABEL_NAMES[int(train_labels[index])],
-                                "raw_peak": float(coarse_peaks[index].item()),
-                                "raw_mean": float(coarse_means[index].item()),
-                                "target_prob": float(probs[index, TARGET_LABEL]),
-                                "clutter_prob": float(probs[index, CLUTTER_LABEL]),
-                                "delta": float(deltas_tensor[index].item()),
-                                "gate": float(gates_tensor[index].item()),
-                                "coarse_detected": bool(
-                                    coarse_peaks[index].item() >= 0.5
-                                ),
-                                "refined_detected": bool(
-                                    refined_peaks[index].item() >= 0.5
-                                ),
-                            }
-                        )
+                        coarse_detected = bool(coarse_peaks[index].item() > 0.5)
+                        refined_detected = bool(refined_peaks[index].item() > 0.5)
+                        record = {
+                            "image": image_name,
+                            "candidate_id": candidate_id,
+                            "strict_label": LABEL_NAMES[int(strict_labels[index])],
+                            "training_label": LABEL_NAMES[int(train_labels[index])],
+                            "raw_peak": float(coarse_peaks[index].item()),
+                            "raw_mean": float(coarse_means[index].item()),
+                            "target_prob": float(probs[index, TARGET_LABEL]),
+                            "clutter_prob": float(probs[index, CLUTTER_LABEL]),
+                            "delta": float(deltas_tensor[index].item()),
+                            "gate": float(gates_tensor[index].item()),
+                            "coarse_detected": coarse_detected,
+                            "refined_detected": refined_detected,
+                        }
+                        if self.args.ccrr_version == "v1_threshold_aware":
+                            positive_support = (
+                                candidate_masks_tensor[index]
+                                & (coarse_candidate_probabilities[index] > 0.5)
+                            )
+                            refined_positive_support = (
+                                candidate_masks_tensor[index]
+                                & (refined_candidate_probabilities[index] > 0.5)
+                            )
+                            action_passed = bool(gates_tensor[index].item() >= 0.5)
+                            record.update(
+                                {
+                                    "action_threshold_passed": action_passed,
+                                    "peak_before": float(
+                                        coarse_peaks[index].item()
+                                    ),
+                                    "peak_after": float(
+                                        refined_peaks[index].item()
+                                    ),
+                                    "required_delta": float(
+                                        required_deltas_tensor[index].item()
+                                    ),
+                                    "actual_delta": float(
+                                        deltas_tensor[index].item()
+                                    ),
+                                    "crossed_output_threshold": bool(
+                                        coarse_detected and not refined_detected
+                                    ),
+                                    "candidate_positive_support_eliminated": bool(
+                                        action_passed
+                                        and positive_support.any().item()
+                                        and not refined_positive_support.any().item()
+                                    ),
+                                    "is_target": bool(
+                                        train_labels[index] == TARGET_LABEL
+                                    ),
+                                    "is_clutter": bool(
+                                        train_labels[index] == CLUTTER_LABEL
+                                    ),
+                                }
+                            )
+                        candidate_records.append(record)
 
                     target_scores = candidate_outputs["target_scores"].detach().cpu().numpy()
                     raw_scores = self._candidate_score(candidates).detach().cpu().numpy()
@@ -1774,6 +2080,31 @@ class Trainer:
             summary["FPPI"] = float(curve["FPPI"][half_index])
             summary["Fa_per_million_pixels"] = float(
                 curve["Fa_per_million_pixels"][half_index]
+            )
+            true_positives = int(curve["true_positives"][half_index])
+            false_positives = int(curve["false_positives"][half_index])
+            false_negatives = int(curve["num_targets"]) - true_positives
+            object_precision = (
+                true_positives / (true_positives + false_positives)
+                if true_positives + false_positives
+                else float("nan")
+            )
+            summary.update(
+                {
+                    "true_positive_components": true_positives,
+                    "false_positive_components": false_positives,
+                    "false_negative_targets": false_negatives,
+                    "false_alarm_pixels": int(
+                        curve["false_alarm_pixels"][half_index]
+                    ),
+                    "object_precision": float(object_precision),
+                    "object_f1": float(
+                        2.0 * object_precision * summary["Pd"]
+                        / (object_precision + summary["Pd"])
+                        if object_precision + summary["Pd"] > 0
+                        else float("nan")
+                    ),
+                }
             )
 
         install_correct_fixed_metrics(coarse_summary, coarse_froc)
@@ -1937,7 +2268,14 @@ class Trainer:
                     np.concatenate(delta_labels, axis=0)
                     if delta_labels
                     else np.empty((0,), dtype=np.int64),
-                    self.args.max_delta,
+                    (
+                        None
+                        if self.args.ccrr_version == "v1_threshold_aware"
+                        and self.args.max_action_suppression == 0
+                        else self.args.max_action_suppression
+                        if self.args.ccrr_version == "v1_threshold_aware"
+                        else self.args.max_delta
+                    ),
                 ),
                 "num_candidates": int(scores.size),
                 "num_gt_targets": int(total_gt_targets),
@@ -1962,6 +2300,73 @@ class Trainer:
                     },
                 },
             }
+            if self.args.ccrr_version == "v1_threshold_aware":
+                actions = [
+                    record
+                    for record in candidate_records
+                    if record.get("action_threshold_passed", False)
+                ]
+                coarse_positive_actions = [
+                    record for record in actions if record["coarse_detected"]
+                ]
+                clutter_actions = [
+                    record for record in actions if record["is_clutter"]
+                ]
+                target_actions = [
+                    record for record in actions if record["is_target"]
+                ]
+                crossed_actions = [
+                    record
+                    for record in coarse_positive_actions
+                    if record["crossed_output_threshold"]
+                ]
+                support_eliminated = [
+                    record
+                    for record in coarse_positive_actions
+                    if record["candidate_positive_support_eliminated"]
+                ]
+
+                def action_ratio(numerator: int, denominator: int) -> float:
+                    return (
+                        float(numerator / denominator)
+                        if denominator
+                        else float("nan")
+                    )
+
+                metrics["candidate"]["action_operating_point"] = {
+                    "clutter_action_threshold": float(
+                        self.args.clutter_action_threshold
+                    ),
+                    "remove_threshold": float(
+                        self.args.clutter_peak_ceiling
+                    ),
+                    "num_actions": len(actions),
+                    "num_clutter_actions": len(clutter_actions),
+                    "num_target_actions": len(target_actions),
+                    "action_precision": action_ratio(
+                        len(clutter_actions), len(actions)
+                    ),
+                    "num_actions_on_coarse_positive_candidates": len(
+                        coarse_positive_actions
+                    ),
+                    "num_candidates_crossing_output_threshold": len(
+                        crossed_actions
+                    ),
+                    "threshold_crossing_rate": action_ratio(
+                        len(crossed_actions), len(coarse_positive_actions)
+                    ),
+                    "num_candidate_positive_supports_eliminated": len(
+                        support_eliminated
+                    ),
+                    "support_removal_rate": action_ratio(
+                        len(support_eliminated), len(coarse_positive_actions)
+                    ),
+                    "target_candidate_threshold_crossings": sum(
+                        bool(record["crossed_output_threshold"])
+                        for record in target_actions
+                    ),
+                    "component_transitions": dict(detection_transitions),
+                }
 
         if self.mode == "train" and select_weights:
             score_key = "refined" if self.args.enable_ccrr else "coarse"

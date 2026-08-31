@@ -271,6 +271,177 @@ def generate_candidates(
     }
 
 
+def generate_recovery_candidates(
+    coarse_logits: torch.Tensor,
+    multi_scale_logits: Sequence[torch.Tensor] | torch.Tensor,
+    threshold_low: float = 0.05,
+    threshold_high: float = 0.5,
+    local_max_kernel: int = 5,
+    proposal_size: int = 15,
+    max_candidates_per_image: int = 32,
+) -> dict[str, torch.Tensor]:
+    """Generate deterministic low-score square proposals around local peaks.
+
+    The evidence map is the maximum probability across the fused coarse output
+    and every resized scale output.  A peak is eligible only when its evidence
+    is strictly above ``threshold_low`` while the fused coarse probability at
+    that location is strictly below ``threshold_high``.  This targets weak or
+    scale-specific responses without duplicating already-positive coarse
+    detections.  No GT information is used.
+    """
+
+    if not 0.0 <= float(threshold_low) <= 1.0:
+        raise ValueError("threshold_low must be in [0,1]")
+    if not 0.0 <= float(threshold_high) <= 1.0:
+        raise ValueError("threshold_high must be in [0,1]")
+    if threshold_low >= threshold_high:
+        raise ValueError("threshold_low must be below threshold_high")
+    if int(local_max_kernel) != local_max_kernel or local_max_kernel < 1 or local_max_kernel % 2 == 0:
+        raise ValueError("local_max_kernel must be a positive odd integer")
+    if int(proposal_size) != proposal_size or proposal_size < 1 or proposal_size % 2 == 0:
+        raise ValueError("proposal_size must be a positive odd integer")
+    if int(max_candidates_per_image) != max_candidates_per_image or max_candidates_per_image < 1:
+        raise ValueError("max_candidates_per_image must be a positive integer")
+
+    coarse = _as_binary_logits(coarse_logits, "coarse_logits")
+    batch_size, _, height, width = coarse.shape
+    scales = _logits_sequence(multi_scale_logits)
+    if not scales:
+        scales = [coarse]
+    resized_logits = []
+    for scale_index, scale_logits in enumerate(scales):
+        scale = _as_binary_logits(scale_logits, f"multi_scale_logits[{scale_index}]")
+        if scale.shape[0] != batch_size:
+            raise ValueError("all multi-scale logits must have the same batch size as coarse_logits")
+        scale = scale.to(device=coarse.device, dtype=coarse.dtype)
+        if scale.shape[-2:] != (height, width):
+            scale = F.interpolate(scale, size=(height, width), mode="bilinear", align_corners=False)
+        resized_logits.append(scale[:, 0])
+
+    scale_logit_stack = torch.stack(resized_logits, dim=0)  # [L,B,H,W]
+    scale_stack = scale_logit_stack.sigmoid()
+    coarse_probability = coarse.sigmoid()[:, 0]
+    all_logits = torch.cat((coarse[:, 0].unsqueeze(0), scale_logit_stack), dim=0)
+    evidence_logits, source_map = all_logits.max(dim=0)
+    evidence_map = evidence_logits.sigmoid()
+    pooled = F.max_pool2d(
+        evidence_logits.unsqueeze(1),
+        kernel_size=local_max_kernel,
+        stride=1,
+        padding=local_max_kernel // 2,
+    )[:, 0]
+    eligible = (
+        (evidence_map > float(threshold_low))
+        & (coarse_probability < float(threshold_high))
+        & (evidence_logits == pooled)
+    )
+
+    masks = []
+    batch_indices_list = []
+    proposal_scores = []
+    coarse_scores = []
+    coarse_peak_scores = []
+    areas = []
+    scale_responses = []
+    scale_variances = []
+    source_scales = []
+    peak_coordinates = []
+    peaks_before_limit = torch.zeros(
+        (batch_size,), dtype=torch.long, device=coarse.device
+    )
+    half_size = proposal_size // 2
+    scale_variance_map = scale_stack.var(dim=0, unbiased=False)
+
+    for batch_index in range(batch_size):
+        plateau_components = _component_arrays(eligible[batch_index])
+        peaks = []
+        for plateau in plateau_components:
+            plateau_tensor = torch.as_tensor(
+                plateau, dtype=torch.bool, device=coarse.device
+            )
+            flat_indices = torch.nonzero(plateau_tensor.flatten(), as_tuple=False).flatten()
+            plateau_values = evidence_map[batch_index].flatten()[flat_indices]
+            best_flat = int(flat_indices[torch.argmax(plateau_values)].item())
+            peak_y, peak_x = divmod(best_flat, width)
+            peaks.append(
+                (
+                    -float(evidence_map[batch_index, peak_y, peak_x].item()),
+                    peak_y,
+                    peak_x,
+                )
+            )
+        peaks.sort()
+        peaks_before_limit[batch_index] = len(peaks)
+        for negative_score, peak_y, peak_x in peaks[:max_candidates_per_image]:
+            y1 = max(0, peak_y - half_size)
+            y2 = min(height, peak_y + half_size + 1)
+            x1 = max(0, peak_x - half_size)
+            x2 = min(width, peak_x + half_size + 1)
+            mask = torch.zeros((height, width), dtype=torch.bool, device=coarse.device)
+            mask[y1:y2, x1:x2] = True
+            masks.append(mask)
+            batch_indices_list.append(batch_index)
+            proposal_scores.append(evidence_map[batch_index, peak_y, peak_x])
+            coarse_scores.append(coarse_probability[batch_index][mask].mean())
+            coarse_peak_scores.append(coarse_probability[batch_index][mask].amax())
+            areas.append(int(mask.sum().item()))
+            scale_responses.append(scale_stack[:, batch_index, mask].mean(dim=1))
+            scale_variances.append(scale_variance_map[batch_index, mask].mean())
+            # -1 denotes the fused coarse response; 0..L-1 are scale heads.
+            source_scales.append(int(source_map[batch_index, peak_y, peak_x].item()) - 1)
+            peak_coordinates.append((peak_y, peak_x))
+
+    number_of_scales = len(scales)
+    probability_dtype = coarse.dtype
+    if masks:
+        mask_tensor = torch.stack(masks)
+        batch_indices = torch.tensor(batch_indices_list, dtype=torch.long, device=coarse.device)
+        score_tensor = torch.stack(proposal_scores)
+        coarse_score_tensor = torch.stack(coarse_scores)
+        coarse_peak_tensor = torch.stack(coarse_peak_scores)
+        area_tensor = torch.tensor(areas, dtype=torch.long, device=coarse.device)
+        scale_response_tensor = torch.stack(scale_responses)
+        scale_variance_tensor = torch.stack(scale_variances)
+        source_scale_tensor = torch.tensor(source_scales, dtype=torch.long, device=coarse.device)
+        peak_tensor = torch.tensor(peak_coordinates, dtype=torch.long, device=coarse.device)
+    else:
+        mask_tensor = torch.empty((0, height, width), dtype=torch.bool, device=coarse.device)
+        batch_indices = torch.empty((0,), dtype=torch.long, device=coarse.device)
+        score_tensor = torch.empty((0,), dtype=probability_dtype, device=coarse.device)
+        coarse_score_tensor = torch.empty((0,), dtype=probability_dtype, device=coarse.device)
+        coarse_peak_tensor = torch.empty((0,), dtype=probability_dtype, device=coarse.device)
+        area_tensor = torch.empty((0,), dtype=torch.long, device=coarse.device)
+        scale_response_tensor = torch.empty(
+            (0, number_of_scales), dtype=probability_dtype, device=coarse.device
+        )
+        scale_variance_tensor = torch.empty((0,), dtype=probability_dtype, device=coarse.device)
+        source_scale_tensor = torch.empty((0,), dtype=torch.long, device=coarse.device)
+        peak_tensor = torch.empty((0, 2), dtype=torch.long, device=coarse.device)
+
+    boxes = masks_to_roi_boxes({"masks": mask_tensor, "batch_indices": batch_indices})
+    return {
+        "masks": mask_tensor,
+        "candidate_masks": mask_tensor,
+        "boxes": boxes,
+        "batch_indices": batch_indices,
+        "scores": score_tensor,
+        "proposal_scores": score_tensor,
+        "peak_scores": score_tensor,
+        "coarse_scores": coarse_score_tensor,
+        "coarse_peak_scores": coarse_peak_tensor,
+        "areas": area_tensor,
+        "scale_responses": scale_response_tensor,
+        "scale_variance": scale_variance_tensor,
+        "source_scale": source_scale_tensor,
+        "peak_yx": peak_tensor,
+        "stream_ids": torch.ones_like(batch_indices),
+        "num_peaks_before_limit": peaks_before_limit,
+        "max_probability": evidence_map.unsqueeze(1),
+        "mean_probability": scale_stack.mean(dim=0).unsqueeze(1),
+        "scale_variance_map": scale_variance_map.unsqueeze(1),
+    }
+
+
 def _gt_instances_by_batch(
     gt_masks: Any,
     image_hw: tuple[int, int],
@@ -559,6 +730,7 @@ __all__ = [
     "UNCERTAIN_LABEL",
     "LABEL_NAMES",
     "generate_candidates",
+    "generate_recovery_candidates",
     "match_candidates_to_gt",
     "masks_to_roi_boxes",
     "expand_boxes",

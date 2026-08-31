@@ -705,6 +705,178 @@ class SafeClutterSuppressor(nn.Module):
         return refined_logits, deltas, gates
 
 
+class ThresholdAwareClutterSuppressor(nn.Module):
+    """Suppress high-confidence clutter below a fixed output threshold.
+
+    Unlike V1's bounded spatially weighted delta, a selected candidate gets a
+    uniform correction over its currently-positive support.  With no cap, a
+    hard-selected candidate is guaranteed to cross ``output_threshold`` even
+    when the coarse logit is extremely large.
+    """
+
+    def __init__(
+        self,
+        action_threshold: float = 0.90,
+        remove_threshold: float = 0.45,
+        soft_temperature: float = 0.05,
+        max_suppression: float | None = None,
+        output_threshold: float = 0.5,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if not 0.5 < action_threshold < 1.0:
+            raise ValueError("action_threshold must lie in (0.5,1)")
+        if not 0.0 < remove_threshold < output_threshold:
+            raise ValueError("remove_threshold must lie in (0,output_threshold)")
+        if not 0.0 < output_threshold < 1.0:
+            raise ValueError("output_threshold must lie in (0,1)")
+        if soft_temperature <= 0:
+            raise ValueError("soft_temperature must be positive")
+        if max_suppression is not None and max_suppression <= 0:
+            raise ValueError("max_suppression must be positive or None")
+        if not 0 < eps < 0.5:
+            raise ValueError("eps must lie in (0,0.5)")
+        self.action_threshold = float(action_threshold)
+        self.remove_threshold = float(remove_threshold)
+        self.soft_temperature = float(soft_temperature)
+        self.max_suppression = (
+            None if max_suppression is None else float(max_suppression)
+        )
+        self.output_threshold = float(output_threshold)
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        coarse_logits: Tensor,
+        target_scores: Tensor,
+        clutter_scores: Tensor,
+        candidate_masks: Tensor,
+        batch_indices: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        if coarse_logits.ndim != 4 or coarse_logits.shape[1] != 1:
+            raise ValueError("coarse_logits must have shape [B,1,H,W]")
+        if candidate_masks.ndim == 2:
+            candidate_masks = candidate_masks.unsqueeze(0)
+        if candidate_masks.ndim == 4 and candidate_masks.shape[1] == 1:
+            candidate_masks = candidate_masks[:, 0]
+        if candidate_masks.ndim != 3:
+            raise ValueError("candidate_masks must have shape [N,H,W]")
+        num_candidates = candidate_masks.shape[0]
+        if target_scores.ndim != 1 or target_scores.shape[0] != num_candidates:
+            raise ValueError("target_scores must have shape [N]")
+        if clutter_scores.ndim != 1 or clutter_scores.shape[0] != num_candidates:
+            raise ValueError("clutter_scores must have shape [N]")
+        if batch_indices is None:
+            if coarse_logits.shape[0] != 1 and num_candidates:
+                raise ValueError("batch_indices are required for a multi-image batch")
+            batch_indices = torch.zeros(
+                num_candidates, device=coarse_logits.device, dtype=torch.long
+            )
+        else:
+            batch_indices = batch_indices.to(
+                device=coarse_logits.device, dtype=torch.long
+            )
+        if batch_indices.ndim != 1 or batch_indices.shape[0] != num_candidates:
+            raise ValueError("batch_indices must have shape [N]")
+        if num_candidates and (
+            (batch_indices < 0).any()
+            or (batch_indices >= coarse_logits.shape[0]).any()
+        ):
+            raise ValueError("batch_indices contain an index outside coarse_logits")
+        if num_candidates == 0:
+            empty = coarse_logits.new_empty((0,))
+            return {
+                "refined_logits": coarse_logits,
+                "deltas": empty,
+                "gates": empty,
+                "required_deltas": empty,
+                "unclipped_required_deltas": empty,
+                "peak_logits": empty,
+                "active_support": candidate_masks.to(dtype=torch.bool),
+            }
+
+        if tuple(candidate_masks.shape[-2:]) != tuple(coarse_logits.shape[-2:]):
+            candidate_masks = F.interpolate(
+                candidate_masks.unsqueeze(1).float(),
+                size=coarse_logits.shape[-2:],
+                mode="nearest",
+            )[:, 0]
+        masks = (candidate_masks > 0.5).to(device=coarse_logits.device)
+        target_scores = target_scores.to(
+            device=coarse_logits.device, dtype=coarse_logits.dtype
+        )
+        clutter_scores = clutter_scores.to(
+            device=coarse_logits.device, dtype=coarse_logits.dtype
+        )
+        candidate_logits = coarse_logits[batch_indices, 0]
+        valid = masks.flatten(1).any(dim=1)
+        negative_infinity = torch.full_like(candidate_logits, float("-inf"))
+        peak_logits = torch.where(
+            masks, candidate_logits, negative_infinity
+        ).flatten(1).amax(dim=1)
+        peak_logits = torch.where(valid, peak_logits, torch.zeros_like(peak_logits))
+        remove_logit = torch.logit(
+            peak_logits.new_tensor(self.remove_threshold), eps=self.eps
+        )
+        unclipped_required = (remove_logit - peak_logits).clamp(max=0.0)
+        required = unclipped_required
+        if self.max_suppression is not None:
+            required = required.clamp(min=-self.max_suppression)
+
+        raw_soft_gate = torch.sigmoid(
+            (clutter_scores - self.action_threshold) / self.soft_temperature
+        )
+        # Preserve exact identity for the zero-initialized binary head
+        # (p_target == p_clutter == 0.5) during training.
+        identity_gate = torch.sigmoid(
+            (
+                torch.full_like(clutter_scores, 0.5)
+                - self.action_threshold
+            )
+            / self.soft_temperature
+        )
+        maximum_gate = torch.sigmoid(
+            (torch.ones_like(clutter_scores) - self.action_threshold)
+            / self.soft_temperature
+        )
+        soft_gate = (
+            (raw_soft_gate - identity_gate)
+            / (maximum_gate - identity_gate).clamp_min(self.eps)
+        ).clamp(0.0, 1.0)
+        if self.training:
+            gates = soft_gate
+        else:
+            gates = (clutter_scores >= self.action_threshold).to(
+                dtype=coarse_logits.dtype
+            )
+        gates = torch.where(valid, gates, torch.zeros_like(gates))
+        deltas = gates * required
+
+        output_logit = torch.logit(
+            coarse_logits.new_tensor(self.output_threshold), eps=self.eps
+        )
+        active_support = masks & (candidate_logits.detach() > output_logit)
+        per_candidate_correction = (
+            active_support.to(dtype=coarse_logits.dtype) * deltas[:, None, None]
+        )
+        correction = coarse_logits.new_zeros(
+            (coarse_logits.shape[0], coarse_logits.shape[2], coarse_logits.shape[3])
+        )
+        correction = correction.index_add(
+            0, batch_indices, per_candidate_correction
+        )
+        refined_logits = coarse_logits + correction.unsqueeze(1)
+        return {
+            "refined_logits": refined_logits,
+            "deltas": deltas,
+            "gates": gates,
+            "required_deltas": required,
+            "unclipped_required_deltas": unclipped_required,
+            "peak_logits": peak_logits,
+            "active_support": active_support,
+        }
+
+
 class InstanceLogitRectifier(SafeClutterSuppressor):
     """Backward-compatible name/call form for the V1 safe suppressor.
 
@@ -764,12 +936,18 @@ class CCRRModule(nn.Module):
         eps: float = 1e-6,
         zero_effect_initialization: bool = True,
         rectifier: str = "suppression_only",
+        action_threshold: float = 0.90,
+        remove_threshold: float = 0.45,
+        action_temperature: float = 0.05,
+        output_threshold: float = 0.5,
     ) -> None:
         super().__init__()
         self.num_scales = num_scales
         self.num_classes = num_classes
-        if rectifier != "suppression_only":
-            raise ValueError("CCRR-V1 supports only rectifier='suppression_only'")
+        if rectifier not in ("suppression_only", "threshold_aware"):
+            raise ValueError(
+                "rectifier must be 'suppression_only' or 'threshold_aware'"
+            )
         self.encoder = CandidateContextEncoder(
             feature_channels=feature_channels,
             num_scales=num_scales,
@@ -785,13 +963,23 @@ class CCRRModule(nn.Module):
             dropout=dropout,
             zero_effect_initialization=zero_effect_initialization,
         )
-        suppression_limit = max_delta if max_suppression is None else max_suppression
-        self.rectifier = SafeClutterSuppressor(
-            max_suppression=suppression_limit,
-            gate_margin=gate_margin,
-            gate_temperature=gate_temperature,
-            eps=eps,
-        )
+        if rectifier == "suppression_only":
+            suppression_limit = max_delta if max_suppression is None else max_suppression
+            self.rectifier = SafeClutterSuppressor(
+                max_suppression=suppression_limit,
+                gate_margin=gate_margin,
+                gate_temperature=gate_temperature,
+                eps=eps,
+            )
+        else:
+            self.rectifier = ThresholdAwareClutterSuppressor(
+                action_threshold=action_threshold,
+                remove_threshold=remove_threshold,
+                soft_temperature=action_temperature,
+                max_suppression=max_suppression,
+                output_threshold=output_threshold,
+                eps=eps,
+            )
 
     def forward(
         self,
@@ -862,13 +1050,19 @@ class CCRRModule(nn.Module):
         else:
             uncertain_scores = class_probs.new_zeros((class_probs.shape[0],))
 
-        refined_logits, deltas, gates = self.rectifier(
+        rectifier_outputs = self.rectifier(
             coarse_logits,
             target_scores,
             clutter_scores,
             masks,
             batch_indices,
         )
+        if isinstance(rectifier_outputs, Mapping):
+            refined_logits = rectifier_outputs["refined_logits"]
+            deltas = rectifier_outputs["deltas"]
+            gates = rectifier_outputs["gates"]
+        else:
+            refined_logits, deltas, gates = rectifier_outputs
         candidate_outputs = {
             "class_logits": class_logits,
             "class_probs": class_probs,
@@ -883,6 +1077,14 @@ class CCRRModule(nn.Module):
             "scale_features": scale_features,
             "relation_features": relation_features,
         }
+        if isinstance(rectifier_outputs, Mapping):
+            for key in (
+                "required_deltas",
+                "unclipped_required_deltas",
+                "peak_logits",
+                "active_support",
+            ):
+                candidate_outputs[key] = rectifier_outputs[key]
         return refined_logits, candidate_outputs
 
 
@@ -891,5 +1093,6 @@ __all__ = [
     "ReliabilityHead",
     "InstanceLogitRectifier",
     "SafeClutterSuppressor",
+    "ThresholdAwareClutterSuppressor",
     "CCRRModule",
 ]

@@ -1,0 +1,61 @@
+project: MSHNet-CCRR
+stage: head_only
+version: v1_threshold_aware
+seed: 42
+
+candidate:
+  threshold: 0.2
+  training_label_mode: target_presence
+  hard_negative_reporting_threshold: 0.5
+  easy_negative_weight: 0.5
+  hard_negative_weight: 2.0
+  hardness_gamma: 2.0
+  min_area: 1
+  max_area: 1024
+
+model:
+  feature_channels: 16
+  num_scales: 4
+  roi_size: 7
+  hidden_dim: 64
+  context_scale: 3.0
+  min_context_size: 15
+  dropout: 0.3
+  rectifier: threshold_aware
+  clutter_action_threshold: 0.90
+  action_temperature: 0.05
+  remove_threshold: 0.45
+  max_action_suppression: null
+  output_probability_threshold: 0.5
+  zero_effect_initialization: true
+
+loss:
+  classification: class_balanced_binary_focal
+  clutter_focal_gamma: 2.0
+  clutter_positive_alpha: 0.75
+  lambda_refined: 0.5
+  lambda_candidate: 1.0
+  lambda_calibration: 0.05
+  lambda_action: 1.0
+  target_allowed_peak_drop: 0.01
+  clutter_peak_ceiling: 0.45
+
+training:
+  epochs: 1000
+  ccrr_lr: 0.0003
+  weight_decay: 0.001
+  scheduler: cosine
+  eta_min: 0.000001
+  use_online_candidates: true
+  use_train_augmentation: true
+  validation_split: null
+  development_selection_source: official_test
+  test_start_epoch: 500
+  test_interval: 1
+  probability_threshold: 0.5
+  max_train_batches: 0
+  max_test_batches: 0
+  selection_metrics:
+    - mIoU
+    - Pd
+  checkpoint_schema: mshnet-ccrr-weight/v2-safe

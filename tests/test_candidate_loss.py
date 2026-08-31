@@ -1,9 +1,11 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
 from model.candidate_loss import (
     CCRRLoss,
     CandidateBrierLoss,
+    CandidateBinaryFocalLoss,
     CandidateClassificationLoss,
     RectificationPreservationLoss,
 )
@@ -40,6 +42,78 @@ def test_binary_losses_ignore_minus_one_candidates():
         probabilities - F.one_hot(labels[[0, 2]], num_classes=2)
     ).square().sum(dim=1).mean()
     torch.testing.assert_close(calibration, expected_calibration)
+
+
+def test_binary_focal_loss_matches_class_balanced_hand_calculation():
+    logits = torch.tensor(
+        [[2.0, 0.0], [1.0, 0.0], [0.0, 1.0]], requires_grad=True
+    )
+    labels = torch.tensor([0, 0, 1])
+    gamma = 2.0
+    alpha = 0.75
+
+    actual = CandidateBinaryFocalLoss(
+        gamma=gamma, positive_alpha=alpha
+    )(logits, labels)
+
+    binary_logits = logits[:, 1] - logits[:, 0]
+    probabilities = binary_logits.sigmoid()
+    bce = F.binary_cross_entropy_with_logits(
+        binary_logits, labels.float(), reduction="none"
+    )
+    target_terms = (1.0 - alpha) * probabilities[:2].pow(gamma) * bce[:2]
+    clutter_term = alpha * (1.0 - probabilities[2]).pow(gamma) * bce[2]
+    expected = target_terms.mean() + clutter_term
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+def test_binary_focal_loss_ignores_candidates_and_normalizes_sample_weights_by_class():
+    logits = torch.tensor([[0.0, 1.0], [2.0, 0.0], [1.0, 0.0]])
+    labels = torch.tensor([1, 0, -1])
+    sample_weights = torch.tensor([3.0, 2.0, 100.0])
+    loss = CandidateBinaryFocalLoss(gamma=0.0, positive_alpha=0.75)(
+        logits, labels, sample_weights
+    )
+
+    binary_logits = logits[:, 1] - logits[:, 0]
+    bce = F.binary_cross_entropy_with_logits(
+        binary_logits[:2], labels[:2].float(), reduction="none"
+    )
+    expected = 0.75 * bce[0] + 0.25 * bce[1]
+    torch.testing.assert_close(loss, expected)
+
+
+def test_binary_focal_loss_applies_sample_weights_within_each_class():
+    logits = torch.tensor(
+        [[0.0, 2.0], [0.0, -1.0], [1.0, 0.0], [-2.0, 0.0]]
+    )
+    labels = torch.tensor([1, 1, 0, 0])
+    weights = torch.tensor([3.0, 1.0, 2.0, 4.0])
+    alpha = 0.75
+
+    actual = CandidateBinaryFocalLoss(
+        gamma=0.0, positive_alpha=alpha
+    )(logits, labels, weights)
+
+    binary_logits = logits[:, 1] - logits[:, 0]
+    bce = F.binary_cross_entropy_with_logits(
+        binary_logits, labels.float(), reduction="none"
+    )
+    expected = (
+        alpha * (3.0 * bce[0] + bce[1]) / 4.0
+        + (1.0 - alpha) * (2.0 * bce[2] + 4.0 * bce[3]) / 6.0
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_ccrr_binary_focal_rejects_unused_class_weights():
+    with pytest.raises(ValueError, match="class_weights must be None"):
+        CCRRLoss(
+            class_weights=[1.0, 1.0],
+            classification_mode="binary_focal",
+        )
 
 
 def test_classification_supports_sample_weights_and_label_smoothing():

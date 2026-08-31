@@ -7,6 +7,7 @@ from model.ccrr import (
     InstanceLogitRectifier,
     ReliabilityHead,
     SafeClutterSuppressor,
+    ThresholdAwareClutterSuppressor,
 )
 
 
@@ -134,6 +135,125 @@ def test_safe_suppressor_is_differentiable_and_only_decreases_candidate_pixels()
     assert coarse.grad is not None and coarse.grad.abs().sum() > 0
     assert target_scores.grad is not None and target_scores.grad.abs().sum() > 0
     assert clutter_scores.grad is not None and clutter_scores.grad.abs().sum() > 0
+
+
+def test_threshold_aware_suppressor_crosses_output_threshold_without_cap():
+    rectifier = ThresholdAwareClutterSuppressor(
+        action_threshold=0.9, remove_threshold=0.45, max_suppression=None
+    )
+    rectifier.eval()
+    coarse = torch.full((1, 1, 5, 5), -10.0)
+    coarse[0, 0, 1:3, 1:3] = torch.tensor([[72.0, 20.0], [3.0, 0.1]])
+    masks = torch.zeros((1, 5, 5), dtype=torch.bool)
+    masks[0, 1:3, 1:3] = True
+
+    outputs = rectifier(
+        coarse,
+        target_scores=torch.tensor([0.01]),
+        clutter_scores=torch.tensor([0.99]),
+        candidate_masks=masks,
+        batch_indices=torch.tensor([0]),
+    )
+
+    refined = outputs["refined_logits"]
+    assert outputs["gates"].tolist() == [1.0]
+    assert outputs["unclipped_required_deltas"].item() < -72.0
+    assert torch.all(refined[0, 0][masks[0]].sigmoid() <= 0.45 + 1e-6)
+    assert not torch.any(refined.sigmoid() > 0.5)
+    assert torch.equal(refined[0, 0][~masks[0]], coarse[0, 0][~masks[0]])
+
+
+def test_threshold_aware_suppressor_exposes_insufficient_cap():
+    rectifier = ThresholdAwareClutterSuppressor(
+        action_threshold=0.9,
+        remove_threshold=0.45,
+        max_suppression=6.0,
+    )
+    rectifier.eval()
+    coarse = torch.full((1, 1, 3, 3), -10.0)
+    coarse[0, 0, 1, 1] = 10.0
+    mask = torch.zeros((1, 3, 3), dtype=torch.bool)
+    mask[0, 1, 1] = True
+
+    outputs = rectifier(
+        coarse,
+        torch.tensor([0.01]),
+        torch.tensor([0.99]),
+        mask,
+    )
+
+    assert outputs["required_deltas"].item() == pytest.approx(-6.0)
+    assert outputs["refined_logits"][0, 0, 1, 1] > 0
+
+
+def test_threshold_aware_training_gate_is_identity_at_zero_head_scores():
+    rectifier = ThresholdAwareClutterSuppressor()
+    rectifier.train()
+    coarse = torch.randn(1, 1, 4, 4)
+    mask = torch.ones((1, 4, 4), dtype=torch.bool)
+    clutter_score = torch.tensor([0.5], requires_grad=True)
+
+    outputs = rectifier(
+        coarse,
+        torch.tensor([0.5]),
+        clutter_score,
+        mask,
+    )
+
+    assert outputs["gates"].item() == 0.0
+    torch.testing.assert_close(outputs["refined_logits"], coarse, atol=0.0, rtol=0.0)
+    outputs["refined_logits"].sum().backward()
+    assert clutter_score.grad is not None
+    assert clutter_score.grad.abs().item() > 0
+
+
+def test_threshold_aware_training_gate_reaches_one_at_unit_clutter_score():
+    rectifier = ThresholdAwareClutterSuppressor()
+    rectifier.train()
+    coarse = torch.full((1, 1, 3, 3), -2.0)
+    coarse[0, 0, 1, 1] = 10.0
+    mask = torch.zeros((1, 3, 3), dtype=torch.bool)
+    mask[0, 1, 1] = True
+
+    outputs = rectifier(
+        coarse,
+        torch.tensor([0.0]),
+        torch.tensor([1.0]),
+        mask,
+    )
+
+    assert outputs["gates"].item() == pytest.approx(1.0)
+    assert outputs["refined_logits"][0, 0, 1, 1].sigmoid() <= 0.45 + 1e-6
+
+
+def test_threshold_aware_overlapping_actions_only_add_suppression():
+    rectifier = ThresholdAwareClutterSuppressor()
+    rectifier.eval()
+    coarse = torch.full((1, 1, 4, 4), -3.0)
+    coarse[0, 0, 1:3, 1:3] = torch.tensor([[8.0, 4.0], [3.0, 1.0]])
+    masks = torch.zeros((2, 4, 4), dtype=torch.bool)
+    masks[0, 1:3, 1:3] = True
+    masks[1, 1:3, 2] = True
+
+    outputs = rectifier(
+        coarse,
+        torch.tensor([0.01, 0.01]),
+        torch.tensor([0.99, 0.99]),
+        masks,
+        torch.tensor([0, 0]),
+    )
+
+    union = masks.any(dim=0)
+    assert torch.all(outputs["refined_logits"] <= coarse)
+    assert torch.all(
+        outputs["refined_logits"][0, 0][union].sigmoid() <= 0.45 + 1e-6
+    )
+    torch.testing.assert_close(
+        outputs["refined_logits"][0, 0][~union],
+        coarse[0, 0][~union],
+        atol=0.0,
+        rtol=0.0,
+    )
 
 
 def test_legacy_rectifier_api_remains_safe():

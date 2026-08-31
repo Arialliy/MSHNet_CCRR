@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from utils.detection_metric import SegmentationFROC
+from utils.detection_metric import SegmentationFROC, maximum_centroid_pairs
 
 
 def test_segmentation_froc_does_not_drop_equal_area_false_positive():
@@ -38,3 +38,8 @@ def test_segmentation_froc_probability_thresholds_and_empty_gt():
     target_free = SegmentationFROC([0.5])
     target_free.update(probabilities, torch.zeros_like(target), from_logits=False)
     assert np.isnan(target_free.get()["Pd"]).all()
+
+
+def test_public_centroid_pairs_reject_invalid_distance():
+    with pytest.raises(ValueError, match="non-negative"):
+        maximum_centroid_pairs([], [], -1.0)

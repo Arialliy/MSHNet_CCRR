@@ -11,6 +11,7 @@ from utils.candidate import (
     expand_boxes,
     extract_scale_features,
     generate_candidates,
+    generate_recovery_candidates,
     masks_to_roi_boxes,
     match_candidates_to_gt,
 )
@@ -60,6 +61,72 @@ def test_generate_candidates_has_shape_stable_empty_output():
     assert result["batch_indices"].shape == (0,)
     assert result["scale_responses"].shape == (0, 1)
     assert result["scale_variance"].shape == (0,)
+
+
+def test_generate_recovery_candidates_uses_local_max_and_strict_score_band():
+    def logit(probability: float) -> float:
+        return math.log(probability / (1.0 - probability))
+
+    coarse = torch.full((1, 1, 9, 9), logit(0.01))
+    scale = torch.full_like(coarse, logit(0.01))
+    scale[0, 0, 4, 4] = logit(0.4)
+    scale[0, 0, 1, 1] = logit(0.05)  # Strictly equal to low: excluded.
+    coarse[0, 0, 7, 7] = logit(0.6)
+    scale[0, 0, 7, 7] = logit(0.9)  # Coarse already positive: excluded.
+
+    result = generate_recovery_candidates(
+        coarse,
+        [scale],
+        threshold_low=0.05,
+        threshold_high=0.5,
+        local_max_kernel=3,
+        proposal_size=5,
+        max_candidates_per_image=8,
+    )
+
+    assert result["peak_yx"].tolist() == [[4, 4]]
+    assert result["areas"].tolist() == [25]
+    assert result["stream_ids"].tolist() == [1]
+    assert result["source_scale"].tolist() == [0]
+    assert result["num_peaks_before_limit"].tolist() == [1]
+    assert result["proposal_scores"].item() == pytest.approx(0.4)
+
+
+def test_generate_recovery_candidates_includes_coarse_weak_peak_and_caps_count():
+    def logit(probability: float) -> float:
+        return math.log(probability / (1.0 - probability))
+
+    coarse = torch.full((1, 1, 9, 9), logit(0.01))
+    coarse[0, 0, 2, 2] = logit(0.4)
+    coarse[0, 0, 6, 6] = logit(0.3)
+    scale = torch.full_like(coarse, logit(0.01))
+
+    result = generate_recovery_candidates(
+        coarse,
+        [scale],
+        threshold_low=0.05,
+        threshold_high=0.5,
+        local_max_kernel=3,
+        proposal_size=3,
+        max_candidates_per_image=1,
+    )
+
+    assert result["num_peaks_before_limit"].tolist() == [2]
+    assert result["peak_yx"].tolist() == [[2, 2]]
+    assert result["source_scale"].tolist() == [-1]
+    assert result["boxes"].tolist() == [[0.0, 1.0, 1.0, 4.0, 4.0]]
+
+
+def test_generate_recovery_candidates_has_stable_empty_shapes():
+    logits = torch.full((2, 1, 8, 8), -20.0)
+
+    result = generate_recovery_candidates(logits, [logits], threshold_low=0.05)
+
+    assert result["masks"].shape == (0, 8, 8)
+    assert result["boxes"].shape == (0, 5)
+    assert result["peak_yx"].shape == (0, 2)
+    assert result["scale_responses"].shape == (0, 1)
+    assert result["num_peaks_before_limit"].tolist() == [0, 0]
 
 
 def test_match_candidates_to_gt_uses_three_state_label_order():

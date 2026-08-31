@@ -22,12 +22,15 @@ def _normalise_maps(value: Any, name: str) -> torch.Tensor:
     return tensor
 
 
-def _maximum_centroid_matching(
+def maximum_centroid_pairs(
     gt_centroids: list[np.ndarray],
     prediction_centroids: list[np.ndarray],
     maximum_distance: float,
-) -> set[int]:
-    """Return prediction indices in a maximum-cardinality bipartite match."""
+) -> list[tuple[int, int]]:
+    """Return deterministic ``(gt, prediction)`` maximum-cardinality pairs."""
+
+    if not np.isfinite(maximum_distance) or maximum_distance < 0:
+        raise ValueError("maximum_distance must be finite and non-negative")
 
     adjacency: list[list[int]] = []
     for gt_centroid in gt_centroids:
@@ -37,8 +40,9 @@ def _maximum_centroid_matching(
             if np.linalg.norm(prediction_centroid - gt_centroid) <= maximum_distance
         ]
         neighbors.sort(
-            key=lambda index: float(
-                np.linalg.norm(prediction_centroids[index] - gt_centroid)
+            key=lambda index: (
+                float(np.linalg.norm(prediction_centroids[index] - gt_centroid)),
+                index,
             )
         )
         adjacency.append(neighbors)
@@ -57,9 +61,32 @@ def _maximum_centroid_matching(
         return False
 
     # Sparse GTs first reduces needless rematching and remains deterministic.
-    for gt_index in sorted(range(len(gt_centroids)), key=lambda index: len(adjacency[index])):
+    for gt_index in sorted(
+        range(len(gt_centroids)), key=lambda index: (len(adjacency[index]), index)
+    ):
         augment(gt_index, set())
-    return set(prediction_to_gt)
+    return sorted(
+        (
+            (gt_index, prediction_index)
+            for prediction_index, gt_index in prediction_to_gt.items()
+        ),
+        key=lambda pair: pair[0],
+    )
+
+
+def _maximum_centroid_matching(
+    gt_centroids: list[np.ndarray],
+    prediction_centroids: list[np.ndarray],
+    maximum_distance: float,
+) -> set[int]:
+    """Backward-compatible prediction-index view of centroid matching."""
+
+    return {
+        prediction_index
+        for _, prediction_index in maximum_centroid_pairs(
+            gt_centroids, prediction_centroids, maximum_distance
+        )
+    }
 
 
 class SegmentationFROC:
@@ -176,4 +203,4 @@ class SegmentationFROC:
         }
 
 
-__all__ = ["SegmentationFROC"]
+__all__ = ["SegmentationFROC", "maximum_centroid_pairs"]

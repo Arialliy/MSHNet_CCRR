@@ -87,7 +87,45 @@ def test_v1_safe_model_defaults_keep_requested_test_schedule(monkeypatch):
     assert args.ccrr_lr == pytest.approx(3e-4)
     assert args.epochs == 1000
     assert args.test_start_epoch == 500
+    assert args.ccrr_version == "v1_safe"
     assert not hasattr(args, "val_start_epoch")
+
+
+def test_threshold_aware_cli_and_inference_config_are_versioned(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--enable-ccrr",
+            "--ccrr-version",
+            "v1_threshold_aware",
+        ],
+    )
+    args = parse_args()
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+
+    config = trainer._inference_config()
+
+    assert config["ccrr_version"] == "v1_threshold_aware"
+    assert config["rectifier"] == "threshold_aware"
+    assert config["clutter_action_threshold"] == pytest.approx(0.9)
+    assert config["remove_threshold"] == pytest.approx(0.45)
+    assert config["max_action_suppression"] is None
+
+
+def test_v1_safe_inference_config_omits_new_version_fields(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--enable-ccrr"])
+    args = parse_args()
+    trainer = Trainer.__new__(Trainer)
+    trainer.args = args
+
+    config = trainer._inference_config()
+
+    assert config["rectifier"] == "suppression_only"
+    assert "ccrr_version" not in config
+    assert "clutter_action_threshold" not in config
 
 
 def test_resume_rejects_best_weight_without_optimizer_state(monkeypatch):
