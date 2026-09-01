@@ -54,6 +54,7 @@ from utils.detection_metric import (
     maximum_centroid_pairs,
 )
 from utils.metric import PD_FA
+from utils.pareto import pareto_constraints, pareto_key
 from utils.reliability_metric import (
     candidate_brier_score,
     candidate_ece,
@@ -68,6 +69,19 @@ from utils.reliability_metric import (
 CANDIDATE_BANK_SCHEMA_VERSION = "mshnet-ccrr-candidate-bank/v1"
 WEIGHT_SCHEMA_VERSION = "mshnet-ccrr-weight/v2-safe"
 SCA_WEIGHT_SCHEMA_VERSION = "mshnet-sca-ccrr-weight/v1"
+LEGACY_OPTIONAL_CONFIG_DEFAULTS: dict[str, Any] = {
+    "candidate_pooling": "avg",
+    "candidate_topk_ratio": 0.125,
+    "candidate_minimum_topk": 1,
+    "training_config.candidate_pooling": "avg",
+    "training_config.candidate_topk_ratio": 0.125,
+    "training_config.candidate_minimum_topk": 1,
+    "training_config.target_tail_weight": 0.0,
+    "training_config.target_tail_temperature": 0.1,
+    "training_config.fp_value_beta": 0.0,
+    "training_config.fp_value_max": 3.0,
+    "training_config.save_best_pareto": False,
+}
 
 
 def str2bool(value: Any) -> bool:
@@ -171,6 +185,13 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     parser.add_argument("--ccrr-num-classes", type=int, choices=(2, 3), default=2)
     parser.add_argument("--sca-roi-size", type=int, default=15)
     parser.add_argument("--sca-feature-channels", type=int, default=32)
+    parser.add_argument(
+        "--candidate-pooling",
+        choices=("avg", "avg_max_topk"),
+        default="avg",
+    )
+    parser.add_argument("--candidate-topk-ratio", type=float, default=0.125)
+    parser.add_argument("--candidate-minimum-topk", type=int, default=1)
     parser.add_argument("--risk-threshold", type=float, default=2.0)
     parser.add_argument("--quality-veto-threshold", type=float, default=0.20)
     parser.add_argument("--risk-alpha", type=float, default=1.0)
@@ -202,6 +223,11 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     parser.add_argument("--lambda-rank", type=float, default=0.1)
     parser.add_argument("--target-harm-weight", type=float, default=20.0)
     parser.add_argument("--missed-clutter-weight", type=float, default=1.0)
+    parser.add_argument("--target-tail-weight", type=float, default=0.0)
+    parser.add_argument("--target-tail-temperature", type=float, default=0.1)
+    parser.add_argument("--fp-value-beta", type=float, default=0.0)
+    parser.add_argument("--fp-value-max", type=float, default=3.0)
+    parser.add_argument("--save-best-pareto", action="store_true")
     parser.add_argument("--rank-margin", type=float, default=0.5)
     parser.add_argument("--quality-iou-weight", type=float, default=0.5)
     parser.add_argument("--quality-center-sigma", type=float, default=3.0)
@@ -385,6 +411,143 @@ def _delta_statistics(
             else float("nan")
         ),
     }
+
+
+def _sca_enhanced_diagnostics(
+    records: list[Mapping[str, Any]], *, target_tail_temperature: float
+) -> dict[str, Any]:
+    """Summarize target-tail safety and FP value by exact action component."""
+
+    target_records = [
+        record
+        for record in records
+        if record.get("is_target", False)
+        and not record.get("is_ambiguous", False)
+    ]
+    target_gates = np.asarray(
+        [float(record["gate"]) for record in target_records], dtype=np.float64
+    )
+    if target_gates.size:
+        scaled = target_gates / float(target_tail_temperature)
+        scaled_max = float(scaled.max())
+        target_tail = float(
+            target_tail_temperature
+            * (
+                scaled_max
+                + math.log(float(np.exp(scaled - scaled_max).sum()))
+                - math.log(target_gates.size)
+            )
+        )
+        target_gate = {
+            "count": int(target_gates.size),
+            "target_gate_mean": float(target_gates.mean()),
+            "target_gate_max": float(target_gates.max()),
+            "target_gate_p95": float(np.percentile(target_gates, 95)),
+            "target_gate_p99": float(np.percentile(target_gates, 99)),
+            "target_tail_softmax": target_tail,
+            "num_target_gate_above_0.1": int(np.count_nonzero(target_gates > 0.1)),
+            "num_target_gate_above_0.5": int(np.count_nonzero(target_gates > 0.5)),
+            "num_target_gate_above_action_threshold": int(
+                np.count_nonzero(target_gates >= 0.5)
+            ),
+        }
+    else:
+        target_gate = {
+            "count": 0,
+            "target_gate_mean": float("nan"),
+            "target_gate_max": float("nan"),
+            "target_gate_p95": float("nan"),
+            "target_gate_p99": float("nan"),
+            "target_tail_softmax": 0.0,
+            "num_target_gate_above_0.1": 0,
+            "num_target_gate_above_0.5": 0,
+            "num_target_gate_above_action_threshold": 0,
+        }
+
+    fp_records = [
+        record
+        for record in records
+        if record.get("is_clutter", False)
+        and not record.get("is_ambiguous", False)
+    ]
+    fp_weights = np.asarray(
+        [float(record.get("fp_value_weight", 1.0)) for record in fp_records],
+        dtype=np.float64,
+    )
+    fp_gates = np.asarray(
+        [float(record["gate"]) for record in fp_records], dtype=np.float64
+    )
+    if fp_records:
+        weighted_missed = float(
+            np.sum(fp_weights * (1.0 - fp_gates))
+            / max(float(fp_weights.sum()), 1e-12)
+        )
+        fp_value = {
+            "count": len(fp_records),
+            "fp_value_weight_mean": float(fp_weights.mean()),
+            "fp_value_weight_max": float(fp_weights.max()),
+            "weighted_missed_clutter_loss": weighted_missed,
+            "unweighted_missed_clutter_loss": float((1.0 - fp_gates).mean()),
+        }
+    else:
+        fp_value = {
+            "count": 0,
+            "fp_value_weight_mean": float("nan"),
+            "fp_value_weight_max": float("nan"),
+            "weighted_missed_clutter_loss": 0.0,
+            "unweighted_missed_clutter_loss": 0.0,
+        }
+
+    bin_specs = (
+        ("1_pixel", 1, 1),
+        ("2_4_pixels", 2, 4),
+        ("5_16_pixels", 5, 16),
+        ("17_64_pixels", 17, 64),
+        ("over_64_pixels", 65, None),
+    )
+    area_bins: dict[str, Any] = {}
+    for name, minimum, maximum in bin_specs:
+        members = [
+            record
+            for record in fp_records
+            if int(record.get("action_area", 0)) >= minimum
+            and (maximum is None or int(record.get("action_area", 0)) <= maximum)
+        ]
+        actions = [
+            record
+            for record in members
+            if record.get("action_threshold_passed", False)
+        ]
+        eliminated = [
+            record for record in members if record.get("component_eliminated", False)
+        ]
+        count = len(members)
+        area_bins[name] = {
+            "num_fp_components": count,
+            "num_actions": len(actions),
+            "num_eliminated": len(eliminated),
+            "eliminated_pixels": int(
+                sum(int(record.get("action_area", 0)) for record in eliminated)
+            ),
+            "action_recall": float(len(actions) / count) if count else float("nan"),
+            "removal_recall": (
+                float(len(eliminated) / count) if count else float("nan")
+            ),
+        }
+
+    return {
+        "target_gate": target_gate,
+        "fp_value": fp_value,
+        "fp_area_bins": area_bins,
+    }
+
+
+def _fp_value_weights_for_risk(
+    weights: torch.Tensor, *, beta: float
+) -> torch.Tensor | None:
+    """Select the exact legacy mean path when FP value weighting is disabled."""
+
+    return weights if float(beta) > 0.0 else None
 
 
 def _detection_transition_counts(
@@ -811,6 +974,9 @@ class Trainer:
         self.start_epoch = 0
         self.best_iou = -1.0
         self.best_pd = -1.0
+        self.best_pareto_key: tuple[float, ...] | None = None
+        self.best_pareto_epoch: int | None = None
+        self.best_pareto_metrics: dict[str, Any] | None = None
         self.warm_epoch = args.warm_epoch
         self.parent_weight_sha256: str | None = None
         self.baseline_weight_sha256: str | None = None
@@ -889,6 +1055,9 @@ class Trainer:
                     "num_scales": 4,
                     "roi_size": args.sca_roi_size,
                     "hidden_dim": args.hidden_dim,
+                    "pooling_mode": args.candidate_pooling,
+                    "topk_ratio": args.candidate_topk_ratio,
+                    "minimum_topk": args.candidate_minimum_topk,
                     "context_scale": args.context_scale,
                     "min_context_size": args.min_context_size,
                     "dropout": args.ccrr_dropout,
@@ -954,6 +1123,8 @@ class Trainer:
             self.sca_risk_loss = AsymmetricActionRiskLoss(
                 target_harm_weight=args.target_harm_weight,
                 missed_clutter_weight=args.missed_clutter_weight,
+                target_tail_weight=args.target_tail_weight,
+                target_tail_temperature=args.target_tail_temperature,
             )
             self.sca_rank_loss = CandidateRankLoss(margin=args.rank_margin)
             args.resolved_candidate_class_weights = []
@@ -1043,6 +1214,10 @@ class Trainer:
             raise ValueError("--sca-roi-size must be positive")
         if self.args.sca_feature_channels <= 0 or self.args.sca_feature_channels % 4:
             raise ValueError("--sca-feature-channels must be positive and divisible by 4")
+        if not 0.0 < self.args.candidate_topk_ratio <= 1.0:
+            raise ValueError("--candidate-topk-ratio must lie in (0,1]")
+        if self.args.candidate_minimum_topk <= 0:
+            raise ValueError("--candidate-minimum-topk must be positive")
         if self.args.min_context_size <= 0 or self.args.context_scale <= 0:
             raise ValueError("context sizes must be positive")
         if not 0.0 <= self.args.ccrr_dropout < 1.0:
@@ -1081,6 +1256,17 @@ class Trainer:
             raise ValueError("--quality-center-sigma must be finite and positive")
         if self.args.target_harm_weight < 0 or self.args.missed_clutter_weight < 0:
             raise ValueError("SCA risk weights must be non-negative")
+        if not math.isfinite(self.args.target_tail_weight) or self.args.target_tail_weight < 0:
+            raise ValueError("--target-tail-weight must be finite and non-negative")
+        if (
+            not math.isfinite(self.args.target_tail_temperature)
+            or self.args.target_tail_temperature <= 0
+        ):
+            raise ValueError("--target-tail-temperature must be finite and positive")
+        if not math.isfinite(self.args.fp_value_beta) or self.args.fp_value_beta < 0:
+            raise ValueError("--fp-value-beta must be finite and non-negative")
+        if not math.isfinite(self.args.fp_value_max) or self.args.fp_value_max < 1.0:
+            raise ValueError("--fp-value-max must be finite and at least 1")
         if self.args.rank_margin < 0:
             raise ValueError("--rank-margin must be non-negative")
         if not 0.0 <= self.args.target_allowed_peak_drop <= 1.0:
@@ -1118,6 +1304,14 @@ class Trainer:
                 raise ValueError(
                     "v2_selective_component requires --remove-threshold in (0,0.5)"
                 )
+        if self.args.save_best_pareto and (
+            not self.args.enable_ccrr
+            or self.args.ccrr_version != "v2_selective_component"
+        ):
+            raise ValueError(
+                "--save-best-pareto requires --enable-ccrr with "
+                "--ccrr-version v2_selective_component"
+            )
         if (
             self.args.mode == "train"
             and self.args.enable_ccrr
@@ -1252,6 +1446,13 @@ class Trainer:
                         "ccrr_version": "v2_selective_component",
                         "ccrr_feature_channels": int(
                             self.args.sca_feature_channels
+                        ),
+                        "candidate_pooling": self.args.candidate_pooling,
+                        "candidate_topk_ratio": float(
+                            self.args.candidate_topk_ratio
+                        ),
+                        "candidate_minimum_topk": int(
+                            self.args.candidate_minimum_topk
                         ),
                         "feature_sources": ["x_d0", "x_d1", "x_d2"],
                         "geometry_features": [
@@ -1477,8 +1678,26 @@ class Trainer:
                         "target_harm_weight": float(
                             self.args.target_harm_weight
                         ),
+                        "target_tail_weight": float(
+                            self.args.target_tail_weight
+                        ),
+                        "target_tail_temperature": float(
+                            self.args.target_tail_temperature
+                        ),
                         "missed_clutter_weight": float(
                             self.args.missed_clutter_weight
+                        ),
+                        "fp_value_beta": float(self.args.fp_value_beta),
+                        "fp_value_max": float(self.args.fp_value_max),
+                        "candidate_pooling": self.args.candidate_pooling,
+                        "candidate_topk_ratio": float(
+                            self.args.candidate_topk_ratio
+                        ),
+                        "candidate_minimum_topk": int(
+                            self.args.candidate_minimum_topk
+                        ),
+                        "save_best_pareto": bool(
+                            self.args.save_best_pareto
                         ),
                         "rank_margin": float(self.args.rank_margin),
                         "calibration_protocol": (
@@ -1505,6 +1724,21 @@ class Trainer:
         for key, expected in current.items():
             qualified = f"{prefix}.{key}" if prefix else key
             if key not in saved:
+                legacy_default = LEGACY_OPTIONAL_CONFIG_DEFAULTS.get(
+                    qualified, object()
+                )
+                if isinstance(expected, float) and isinstance(
+                    legacy_default, (int, float)
+                ):
+                    if math.isclose(
+                        float(legacy_default),
+                        expected,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    ):
+                        continue
+                elif legacy_default == expected:
+                    continue
                 differences.append(f"{qualified}: missing")
                 continue
             actual = saved[key]
@@ -1767,6 +2001,22 @@ class Trainer:
         self.start_epoch = int(checkpoint["epoch"]) + 1
         self.best_iou = float(checkpoint["best_miou"])
         self.best_pd = float(checkpoint["best_pd"])
+        pareto_state = checkpoint.get("best_pareto")
+        if isinstance(pareto_state, Mapping):
+            saved_key = pareto_state.get("key")
+            self.best_pareto_key = (
+                tuple(float(value) for value in saved_key)
+                if saved_key is not None
+                else None
+            )
+            saved_epoch = pareto_state.get("epoch")
+            self.best_pareto_epoch = (
+                int(saved_epoch) if saved_epoch is not None else None
+            )
+            saved_metrics = pareto_state.get("metrics")
+            self.best_pareto_metrics = (
+                dict(saved_metrics) if isinstance(saved_metrics, Mapping) else None
+            )
         random.setstate(rng_state["python"])
         np.random.set_state(rng_state["numpy"])
         torch.set_rng_state(rng_state["torch"].cpu())
@@ -1835,6 +2085,13 @@ class Trainer:
             else None,
             "best_miou": self.best_iou,
             "best_pd": self.best_pd,
+            "best_pareto": {
+                "key": list(self.best_pareto_key)
+                if self.best_pareto_key is not None
+                else None,
+                "epoch": self.best_pareto_epoch,
+                "metrics": self.best_pareto_metrics,
+            },
             "iou": self.best_iou,
             "args": vars(self.args),
             "rng_state": {
@@ -2063,6 +2320,22 @@ class Trainer:
         is_target_component = (strict_labels == TARGET_LABEL) & ~ambiguous
         is_fp_component = (strict_labels == CLUTTER_LABEL) & ~ambiguous
         scores = self._candidate_score(candidates).clamp(0.0, 1.0)
+        action_areas = action_masks.flatten(1).sum(dim=1).to(dtype=scores.dtype)
+        image_area = float(action_masks.shape[-2] * action_masks.shape[-1])
+        normalised_log_area = torch.log1p(action_areas) / math.log1p(image_area)
+        fp_value_weights = (
+            1.0
+            + float(getattr(self.args, "fp_value_beta", 0.0))
+            * normalised_log_area
+        ).clamp(
+            min=1.0,
+            max=float(getattr(self.args, "fp_value_max", 3.0)),
+        )
+        fp_value_weights = torch.where(
+            is_fp_component,
+            fp_value_weights,
+            torch.ones_like(fp_value_weights),
+        )
         return {
             "labels": strict_labels,
             "strict_labels": strict_labels,
@@ -2070,6 +2343,8 @@ class Trainer:
             "batch_indices": batch_indices,
             "scores": scores,
             "sample_weights": torch.ones_like(scores),
+            "action_areas": action_areas,
+            "fp_value_weights": fp_value_weights,
             "matched_gt_indices": matched_gt_indices,
             "max_iou": matched_iou,
             "centroid_distance": centroid_distance,
@@ -2183,7 +2458,9 @@ class Trainer:
                 "quality",
                 "action_risk",
                 "target_harm",
+                "target_tail",
                 "missed_clutter",
+                "mean_fp_value_weight",
                 "rank",
             )
         }
@@ -2236,6 +2513,10 @@ class Trainer:
                         candidate_outputs["gates"],
                         matching["is_target_component"],
                         matching["is_fp_component"],
+                        fp_value_weights=_fp_value_weights_for_risk(
+                            matching["fp_value_weights"],
+                            beta=self.args.fp_value_beta,
+                        ),
                     )
                     rank = self.sca_rank_loss(
                         candidate_outputs["risk_score"],
@@ -2247,7 +2528,11 @@ class Trainer:
                         "quality": quality,
                         "action_risk": risk_terms["total"],
                         "target_harm": risk_terms["target_harm"],
+                        "target_tail": risk_terms["target_tail"],
                         "missed_clutter": risk_terms["missed_clutter"],
+                        "mean_fp_value_weight": risk_terms[
+                            "mean_fp_value_weight"
+                        ],
                         "rank": rank,
                     }
                     total_loss = (
@@ -2462,6 +2747,9 @@ class Trainer:
                                         candidate_outputs["action_areas"][
                                             index
                                         ].item()
+                                    ),
+                                    "fp_value_weight": float(
+                                        matching["fp_value_weights"][index].item()
                                     ),
                                     "proposal_area": int(
                                         candidate_outputs["proposal_areas"][
@@ -2964,6 +3252,18 @@ class Trainer:
                     action_operating_point
                 )
                 if self.args.ccrr_version == "v2_selective_component":
+                    metrics["candidate"]["enhanced_diagnostics"] = (
+                        _sca_enhanced_diagnostics(
+                            candidate_records,
+                            target_tail_temperature=float(
+                                getattr(
+                                    self.args,
+                                    "target_tail_temperature",
+                                    0.1,
+                                )
+                            ),
+                        )
+                    )
                     coarse_fppi = float(coarse_summary["FPPI"])
                     coarse_fa = float(
                         coarse_summary["Fa_per_million_pixels"]
@@ -3052,11 +3352,117 @@ class Trainer:
                     ),
                     osp.join(self.save_folder, "best_pd.pkl"),
                 )
+            pareto_feasible = False
+            current_pareto_key: tuple[float, ...] | None = None
+            pareto_constraint_state: dict[str, bool] | None = None
+            pareto_reason: str | None = None
+            if (
+                self.args.enable_ccrr
+                and self.args.ccrr_version == "v2_selective_component"
+            ):
+                try:
+                    pareto_constraint_state = pareto_constraints(
+                        coarse_summary,
+                        refined_summary,
+                    )
+                    pareto_feasible = all(pareto_constraint_state.values())
+                    if pareto_feasible:
+                        current_pareto_key = pareto_key(refined_summary)
+                    else:
+                        failed = [
+                            name
+                            for name, passed in pareto_constraint_state.items()
+                            if not passed
+                        ]
+                        pareto_reason = "current epoch violates: " + ", ".join(
+                            failed
+                        )
+                except (KeyError, TypeError, ValueError) as error:
+                    pareto_reason = f"invalid Pareto metric evidence: {error}"
+
+                metrics["pareto_selection"] = {
+                    "enabled": bool(self.args.save_best_pareto),
+                    "pareto_feasible": pareto_feasible,
+                    "pareto_key": list(current_pareto_key)
+                    if current_pareto_key is not None
+                    else None,
+                    "constraints": pareto_constraint_state,
+                }
+
+                if (
+                    self.args.save_best_pareto
+                    and current_pareto_key is not None
+                    and (
+                        self.best_pareto_key is None
+                        or current_pareto_key > self.best_pareto_key
+                    )
+                ):
+                    self.best_pareto_key = current_pareto_key
+                    self.best_pareto_epoch = int(epoch)
+                    self.best_pareto_metrics = {
+                        "coarse": dict(coarse_summary),
+                        "refined": dict(refined_summary),
+                    }
+                    artifact = self._artifact_payload(
+                        self._state_model().state_dict(),
+                        epoch=epoch,
+                        selection_metric="pareto",
+                        selection_value=float(refined_summary["object_f1"]),
+                    )
+                    artifact["selection_details"] = {
+                        "pareto_key": list(current_pareto_key),
+                        "constraints": pareto_constraint_state,
+                        "coarse": dict(coarse_summary),
+                        "refined": dict(refined_summary),
+                    }
+                    torch.save(
+                        artifact,
+                        osp.join(self.save_folder, "best_pareto.pkl"),
+                    )
+
+                if self.args.save_best_pareto:
+                    if self.best_pareto_key is None and pareto_reason is None:
+                        pareto_reason = (
+                            "no epoch was non-inferior to coarse on all locked metrics"
+                        )
+                    status = {
+                        "pareto_found": self.best_pareto_key is not None,
+                        "current_epoch": int(epoch),
+                        "current_epoch_feasible": pareto_feasible,
+                        "current_epoch_key": list(current_pareto_key)
+                        if current_pareto_key is not None
+                        else None,
+                        "current_constraints": pareto_constraint_state,
+                        "best_pareto_epoch": self.best_pareto_epoch,
+                        "best_pareto_key": list(self.best_pareto_key)
+                        if self.best_pareto_key is not None
+                        else None,
+                        "best_pareto_metrics": self.best_pareto_metrics,
+                        "reason": (
+                            None
+                            if self.best_pareto_key is not None
+                            else pareto_reason
+                        ),
+                    }
+                    Path(self.save_folder, "pareto_status.json").write_text(
+                        json.dumps(_jsonable(status), ensure_ascii=False, indent=2)
+                        + "\n",
+                        encoding="utf-8",
+                    )
             metrics["test_selection"] = {
                 "best_mIoU": self.best_iou,
                 "best_Pd": self.best_pd,
                 "best_mIoU_weight": "best_miou.pkl",
                 "best_Pd_weight": "best_pd.pkl",
+                "best_Pareto_found": self.best_pareto_key is not None,
+                "best_Pareto_epoch": self.best_pareto_epoch,
+                "best_Pareto_key": list(self.best_pareto_key)
+                if self.best_pareto_key is not None
+                else None,
+                "best_Pareto_metrics": self.best_pareto_metrics,
+                "best_Pareto_weight": "best_pareto.pkl"
+                if self.best_pareto_key is not None
+                else None,
             }
 
         if self.args.enable_ccrr:

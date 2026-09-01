@@ -88,6 +88,31 @@ manual V1.1 invocation requires both `--enable-ccrr` and
 `--ccrr-version v1_threshold_aware`.  Using `--enable-ccrr` alone keeps the
 `v1_safe` default.
 
+### SCA-CCRR V2-Enhanced
+
+The enhanced selective component-aligned variant adds masked
+Avg/Max/Top-K pooling, target-tail action protection, exact-component FP value
+weighting and a third non-inferior Pareto checkpoint.  Its frozen experiment
+configuration is
+[`configs/ccrr_v2_enhanced.yaml`](configs/ccrr_v2_enhanced.yaml).  Run the full
+E5 setting on one dataset with:
+
+```bash
+CCRR_DATASET_NAME=IRSTD-1K CCRR_GPU=0 scripts/run_ccrr_v2_enhanced.sh
+```
+
+Set `CCRR_EXPERIMENT` to `E1`, `E2`, `E3`, `E4`, or `E5` for the registered
+ablation matrix.  The runner always uses the official train/test `img_idx`,
+1000 epochs, threshold 0.5, no independent validation split, and test-based
+selection after every epoch from epoch 500.  It retains `best_miou.pkl` and
+`best_pd.pkl`, and writes `best_pareto.pkl` only after all five non-inferiority
+constraints are met; `pareto_status.json` is written even when none is found.
+The three-dataset entrypoint is
+[`scripts/run_ccrr_v2_enhanced_all.sh`](scripts/run_ccrr_v2_enhanced_all.sh).
+When using an independent worktree, `CCRR_RESOURCE_REPO_DIR` may point to the
+checkout that contains the local datasets, baseline checkpoints and virtual
+environment.
+
 Datasets, checkpoints, candidate banks, predictions and run outputs are local
 artifacts and are intentionally excluded from version control.  Place or
 generate them at the paths used by the commands in the execution guide.

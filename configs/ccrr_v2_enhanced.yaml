@@ -1,0 +1,123 @@
+project: MSHNet-SCA-CCRR-Enhanced
+stage: head_only
+version: v2_selective_component
+seed: 42
+
+protocol:
+  use_original_img_idx: true
+  validation_split: null
+  development_selection_source: official_test
+  epochs: 1000
+  test_start_epoch: 500
+  test_every_epoch_after_start: true
+  probability_threshold: 0.5
+  keep_best_miou: true
+  keep_best_pd: true
+  add_best_pareto: true
+
+candidate:
+  proposal_threshold: 0.2
+  output_threshold: 0.5
+  component_aligned: true
+  action_mask: exact_output_component
+  min_area: 1
+  max_area: 1024
+
+feature:
+  sources:
+    - x_d0
+    - x_d1
+    - x_d2
+  fused_channels: 32
+
+relation:
+  roi_size: 15
+  hidden_dim: 64
+  context_scale: 3.0
+  min_context_size: 15
+  dropout: 0.3
+  pooling: avg_max_topk
+  topk_ratio: 0.125
+  minimum_topk: 1
+  use_action_mask_feature: true
+  use_geometry_feature: true
+
+quality:
+  sigma_center: 3.0
+  iou_weight: 0.5
+  loss: smooth_l1
+
+selection:
+  default_action: keep
+  risk_threshold: 2.0
+  quality_veto_threshold: 0.2
+  risk_alpha: 1.0
+  action_temperature: 0.05
+  pareto_constraints:
+    mIoU: non_decreasing
+    nIoU: non_decreasing
+    Pd: non_decreasing
+    FPPI: non_increasing
+    Fa_per_million_pixels: non_increasing
+  pareto_order:
+    - min_FPPI
+    - min_Fa_per_million_pixels
+    - max_object_f1
+    - max_mIoU
+    - max_nIoU
+
+rectification:
+  remove_threshold: 0.45
+  output_threshold: 0.5
+  threshold_aware: true
+  action_mask: exact_output_component
+
+loss:
+  lambda_refined: 0.5
+  lambda_clutter_cls: 1.0
+  lambda_quality: 1.0
+  lambda_action_risk: 1.0
+  lambda_rank: 0.1
+  target_harm_weight: 20.0
+  target_tail_weight: 5.0
+  target_tail_temperature: 0.1
+  missed_clutter_weight: 1.0
+  fp_value_beta: 2.0
+  fp_value_max: 3.0
+  rank_margin: 0.5
+  clutter_focal_gamma: 2.0
+  clutter_positive_alpha: 0.75
+
+training:
+  epochs: 1000
+  test_start_epoch: 500
+  test_interval: 1
+  lr: 0.0003
+  weight_decay: 0.001
+  scheduler: cosine
+  eta_min: 0.000001
+  use_online_candidates: true
+  use_train_augmentation: true
+  max_train_batches: 0
+  max_test_batches: 0
+  validation_split: null
+
+data:
+  datasets:
+    - IRSTD-1K
+    - NUAA-SIRST
+    - NUDT-SIRST
+  split_root: datasets
+  train_manifest: datasets/<dataset>/img_idx/train_<dataset>.txt
+  test_manifest: datasets/<dataset>/img_idx/test_<dataset>.txt
+  independent_validation: false
+  official_test_is_development_set: true
+
+checkpoint:
+  baseline_pattern: checkpoints/baseline/<dataset>_mshnet_baseline.pth
+  schema: mshnet-sca-ccrr-weight/v1
+  files:
+    mIoU: best_miou.pkl
+    Pd: best_pd.pkl
+    Pareto: best_pareto.pkl
+    Pareto_status: pareto_status.json
