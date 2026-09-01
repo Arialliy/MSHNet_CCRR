@@ -525,14 +525,19 @@ class AsymmetricActionRiskLoss(nn.Module):
 
     ``gates`` is the soft probability of suppressing each action component.
     Target components therefore contribute ``gate``, whereas false-positive
-    components contribute ``1 - gate``.  Candidates marked by neither mask
-    are ignored.
+    components contribute ``1 - gate``.  An optional per-component FP value
+    weights the latter term without affecting the target branch.  The smooth
+    target-tail term emphasizes rare, high target gates; its default weight is
+    zero so existing configurations retain the original numerical behavior.
+    Candidates marked by neither mask are ignored.
     """
 
     def __init__(
         self,
         target_harm_weight: float = 20.0,
         missed_clutter_weight: float = 1.0,
+        target_tail_weight: float = 0.0,
+        target_tail_temperature: float = 0.1,
     ) -> None:
         super().__init__()
         if not math.isfinite(target_harm_weight) or target_harm_weight < 0:
@@ -541,14 +546,24 @@ class AsymmetricActionRiskLoss(nn.Module):
             raise ValueError(
                 "missed_clutter_weight must be finite and non-negative"
             )
+        if not math.isfinite(target_tail_weight) or target_tail_weight < 0:
+            raise ValueError("target_tail_weight must be finite and non-negative")
+        if (
+            not math.isfinite(target_tail_temperature)
+            or target_tail_temperature <= 0
+        ):
+            raise ValueError("target_tail_temperature must be finite and positive")
         self.target_harm_weight = float(target_harm_weight)
         self.missed_clutter_weight = float(missed_clutter_weight)
+        self.target_tail_weight = float(target_tail_weight)
+        self.target_tail_temperature = float(target_tail_temperature)
 
     def forward(
         self,
         gates: Tensor,
         is_target_component: Tensor,
         is_fp_component: Tensor,
+        fp_value_weights: Tensor | None = None,
     ) -> dict[str, Tensor]:
         if not isinstance(gates, Tensor):
             raise TypeError("gates must be a tensor")
@@ -566,23 +581,70 @@ class AsymmetricActionRiskLoss(nn.Module):
             reference=gates,
         )
 
+        if fp_value_weights is not None:
+            if not isinstance(fp_value_weights, Tensor):
+                raise TypeError("fp_value_weights must be a tensor or None")
+            if fp_value_weights.ndim != 1 or fp_value_weights.shape != gates.shape:
+                raise ValueError(
+                    "fp_value_weights must have shape "
+                    f"{tuple(gates.shape)}, got {tuple(fp_value_weights.shape)}"
+                )
+            if not fp_value_weights.is_floating_point():
+                raise TypeError("fp_value_weights must be floating point")
+            if fp_value_weights.device != gates.device:
+                raise ValueError(
+                    "fp_value_weights and gates must be on the same device"
+                )
+            if not torch.isfinite(fp_value_weights).all():
+                raise ValueError("fp_value_weights must be finite")
+            if (fp_value_weights < 0).any():
+                raise ValueError("fp_value_weights must be non-negative")
+
         zero = _zero_loss(gates)
         target_harm = zero
+        target_tail = zero
         if is_target_component.any():
-            target_harm = gates[is_target_component].mean()
+            target_gates = gates[is_target_component]
+            target_harm = target_gates.mean()
+            temperature = self.target_tail_temperature
+            target_tail = temperature * (
+                torch.logsumexp(target_gates / temperature, dim=0)
+                - math.log(target_gates.numel())
+            )
 
         missed_clutter = zero
+        mean_fp_value_weight = zero
         if is_fp_component.any():
-            missed_clutter = (1.0 - gates[is_fp_component]).mean()
+            fp_gates = gates[is_fp_component]
+            if fp_value_weights is None:
+                # Keep the original expression intact for exact numerical
+                # compatibility with pre-enhancement configurations.
+                missed_clutter = (1.0 - fp_gates).mean()
+                mean_fp_value_weight = gates.new_ones(())
+            else:
+                fp_weights = fp_value_weights[is_fp_component].to(
+                    dtype=gates.dtype
+                )
+                missed_clutter = (
+                    fp_weights * (1.0 - fp_gates)
+                ).sum() / fp_weights.sum().clamp_min(1e-6)
+                mean_fp_value_weight = fp_weights.mean()
 
+        # Preserve the original operation order when the enhancement is
+        # disabled.  Besides matching values, the loss module still has no
+        # parameters or buffers, so old empty state_dicts load strictly.
         total = (
             self.target_harm_weight * target_harm
             + self.missed_clutter_weight * missed_clutter
         )
+        if self.target_tail_weight != 0.0:
+            total = total + self.target_tail_weight * target_tail
         return {
             "total": total,
             "target_harm": target_harm,
+            "target_tail": target_tail,
             "missed_clutter": missed_clutter,
+            "mean_fp_value_weight": mean_fp_value_weight,
         }
 
 
