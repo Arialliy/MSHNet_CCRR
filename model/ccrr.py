@@ -315,6 +315,110 @@ def _extract_scale_features(
     return torch.cat((response_tensor, scale_variance), dim=1)
 
 
+class MaskedHybridPool(nn.Module):
+    """Pool masked spatial features with average, maximum, and Top-K mean.
+
+    The three statistics are projected back to a fixed-width representation.
+    The projection starts from the masked-average branch so enabling this
+    module does not inject a randomly initialised Max/Top-K contribution at
+    the beginning of an enhanced run.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        output_dim: int,
+        topk_ratio: float = 0.125,
+        minimum_topk: int = 1,
+    ) -> None:
+        super().__init__()
+        if channels <= 0 or output_dim <= 0:
+            raise ValueError("channels and output_dim must be positive")
+        if not 0.0 < topk_ratio <= 1.0:
+            raise ValueError("topk_ratio must lie in (0, 1]")
+        if minimum_topk <= 0:
+            raise ValueError("minimum_topk must be positive")
+
+        self.channels = int(channels)
+        self.output_dim = int(output_dim)
+        self.topk_ratio = float(topk_ratio)
+        self.minimum_topk = int(minimum_topk)
+        self.projection = nn.Sequential(
+            nn.Linear(3 * self.channels, self.output_dim),
+            nn.LayerNorm(self.output_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        nn.init.zeros_(self.projection[0].weight)
+        nn.init.zeros_(self.projection[0].bias)
+        with torch.no_grad():
+            diagonal = min(self.channels, self.output_dim)
+            self.projection[0].weight[:diagonal, :diagonal] = torch.eye(
+                diagonal,
+                device=self.projection[0].weight.device,
+                dtype=self.projection[0].weight.dtype,
+            )
+
+    def forward(self, feature: Tensor, mask: Tensor) -> Tensor:
+        if feature.ndim != 4:
+            raise ValueError("feature must have shape [N,C,H,W]")
+        if feature.shape[1] != self.channels:
+            raise ValueError(
+                f"feature must have {self.channels} channels, received {feature.shape[1]}"
+            )
+        if feature.shape[-2] <= 0 or feature.shape[-1] <= 0:
+            raise ValueError("feature spatial dimensions must be positive")
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        if mask.ndim != 4 or mask.shape[1] != 1:
+            raise ValueError("mask must have shape [N,1,H,W]")
+        if mask.shape[0] != feature.shape[0]:
+            raise ValueError("feature and mask disagree on N")
+        if mask.shape[-2:] != feature.shape[-2:]:
+            raise ValueError("feature and mask spatial sizes differ")
+
+        mask_bool = mask.to(device=feature.device) > 0.0
+        mask_float = mask_bool.to(dtype=feature.dtype)
+        masked_feature = torch.where(mask_bool, feature, torch.zeros_like(feature))
+
+        count = mask_float.flatten(2).sum(dim=-1).clamp_min(1.0)
+        average = masked_feature.flatten(2).sum(dim=-1) / count
+
+        flattened = torch.where(
+            mask_bool,
+            feature,
+            torch.full_like(feature, float("-inf")),
+        ).flatten(2)
+        maximum = flattened.amax(dim=-1)
+        maximum = torch.where(
+            torch.isfinite(maximum), maximum, torch.zeros_like(maximum)
+        )
+
+        valid_count = mask_bool.flatten(2).sum(dim=-1).squeeze(1)
+        k_per_candidate = torch.ceil(
+            valid_count.to(dtype=torch.float32) * self.topk_ratio
+        ).to(dtype=torch.long)
+        k_per_candidate = torch.maximum(
+            k_per_candidate,
+            torch.full_like(k_per_candidate, self.minimum_topk),
+        ).clamp_max(feature.shape[-2] * feature.shape[-1])
+        maximum_k = int(k_per_candidate.max().item()) if k_per_candidate.numel() else 1
+
+        topk_values = flattened.topk(k=maximum_k, dim=-1).values
+        rank = torch.arange(maximum_k, device=feature.device).view(1, 1, -1)
+        selected_rank = rank < k_per_candidate.view(-1, 1, 1)
+        finite = torch.isfinite(topk_values) & selected_rank
+        topk_mean = torch.where(
+            finite, topk_values, torch.zeros_like(topk_values)
+        ).sum(dim=-1) / finite.sum(dim=-1).clamp_min(1)
+
+        statistics = torch.cat((average, maximum, topk_mean), dim=1)
+        output = self.projection(statistics)
+        if not torch.isfinite(output).all():
+            raise ValueError("hybrid pooled features are not finite")
+        return output
+
+
 class CandidateContextEncoder(nn.Module):
     """Encode a candidate core and its surrounding (core-free) ring.
 
@@ -331,6 +435,9 @@ class CandidateContextEncoder(nn.Module):
         hidden_dim: int = 64,
         context_scale: float = 3.0,
         min_context_size: float = 15.0,
+        pooling_mode: str = "avg",
+        topk_ratio: float = 0.125,
+        minimum_topk: int = 1,
     ) -> None:
         super().__init__()
         if feature_channels <= 0 or hidden_dim <= 0 or num_scales <= 0:
@@ -347,6 +454,7 @@ class CandidateContextEncoder(nn.Module):
         self.context_scale = float(context_scale)
         self.min_context_size = float(min_context_size)
         self.output_dim = 4 * hidden_dim + num_scales + 1
+        self.pooling_mode = pooling_mode
 
         # Prefer four groups as proposed for V1, while retaining support for
         # small/non-multiple-of-four dimensions used by callers and tests.
@@ -354,26 +462,51 @@ class CandidateContextEncoder(nn.Module):
             groups for groups in range(min(4, hidden_dim), 0, -1)
             if hidden_dim % groups == 0
         )
-        self.roi_encoder = nn.Sequential(
-            nn.Conv2d(feature_channels, hidden_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(1),
-        )
+        if pooling_mode == "avg":
+            # Preserve the legacy module hierarchy and state-dict keys exactly.
+            self.roi_encoder = nn.Sequential(
+                nn.Conv2d(feature_channels, hidden_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(num_groups, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(num_groups, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(1),
+            )
+            self.spatial_encoder = None
+            self.hybrid_pool = None
+        elif pooling_mode == "avg_max_topk":
+            self.roi_encoder = None
+            self.spatial_encoder = nn.Sequential(
+                nn.Conv2d(feature_channels, hidden_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(num_groups, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(num_groups, hidden_dim),
+                nn.ReLU(inplace=True),
+            )
+            self.hybrid_pool = MaskedHybridPool(
+                channels=hidden_dim,
+                output_dim=hidden_dim,
+                topk_ratio=topk_ratio,
+                minimum_topk=minimum_topk,
+            )
+        else:
+            raise ValueError(f"unsupported pooling_mode={pooling_mode!r}")
 
     # Read-only compatibility aliases for code that inspected the V0 module.
     # They do not register duplicate modules or duplicate state-dict entries.
     @property
     def core_encoder(self) -> nn.Module:
-        return self.roi_encoder
+        if self.roi_encoder is not None:
+            return self.roi_encoder
+        assert self.spatial_encoder is not None
+        return self.spatial_encoder
 
     @property
     def context_encoder(self) -> nn.Module:
-        return self.roi_encoder
+        return self.core_encoder
 
     @staticmethod
     def _expand_boxes(
@@ -533,8 +666,33 @@ class CandidateContextEncoder(nn.Module):
         ring_mask = (core_mask_in_context <= 0.0).to(context_rois.dtype)
         ring_rois = context_rois * ring_mask
 
-        core_features = self.roi_encoder(core_rois)
-        context_features = self.roi_encoder(ring_rois)
+        if self.pooling_mode == "avg":
+            assert self.roi_encoder is not None
+            core_features = self.roi_encoder(core_rois)
+            context_features = self.roi_encoder(ring_rois)
+        else:
+            core_mask_boxes = candidate_boxes.clone()
+            core_mask_boxes[:, 0] = torch.arange(
+                num_candidates,
+                device=core_mask_boxes.device,
+                dtype=core_mask_boxes.dtype,
+            )
+            core_mask_in_core = roi_align(
+                candidate_masks.to(dtype=feature_map.dtype).unsqueeze(1),
+                core_mask_boxes,
+                output_size=self.roi_size,
+                spatial_scale=1.0,
+                sampling_ratio=-1,
+                aligned=True,
+            ).clamp(0.0, 1.0)
+            core_mask = (core_mask_in_core > 0.0).to(core_rois.dtype)
+
+            assert self.spatial_encoder is not None
+            assert self.hybrid_pool is not None
+            core_encoded = self.spatial_encoder(core_rois * core_mask) * core_mask
+            ring_encoded = self.spatial_encoder(context_rois * ring_mask) * ring_mask
+            core_features = self.hybrid_pool(core_encoded, core_mask)
+            context_features = self.hybrid_pool(ring_encoded, ring_mask)
         return torch.cat(
             (
                 core_features,
@@ -1634,6 +1792,9 @@ class SCACRRModule(nn.Module):
         mask_hidden_dim: int = 16,
         eps: float = 1e-6,
         zero_effect_initialization: bool = True,
+        pooling_mode: str = "avg",
+        topk_ratio: float = 0.125,
+        minimum_topk: int = 1,
     ) -> None:
         super().__init__()
         self.num_scales = int(num_scales)
@@ -1646,6 +1807,9 @@ class SCACRRModule(nn.Module):
             hidden_dim=hidden_dim,
             context_scale=context_scale,
             min_context_size=min_context_size,
+            pooling_mode=pooling_mode,
+            topk_ratio=topk_ratio,
+            minimum_topk=minimum_topk,
         )
         self.mask_encoder = ActionMaskEncoder(
             roi_size=roi_size,
@@ -1982,6 +2146,7 @@ class SCACRRModule(nn.Module):
 
 
 __all__ = [
+    "MaskedHybridPool",
     "CandidateContextEncoder",
     "ReliabilityHead",
     "SelectiveReliabilityHead",
