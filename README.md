@@ -64,29 +64,26 @@ files are not used as fallbacks.
 ## CCRR extension
 
 This repository also contains the opt-in Candidate--Context Reliability
-Rectification extension.  The current experimental implementation is the
-threshold-aware CCRR-V1.1 suppressor, which aligns clutter actions with the
-final detection threshold while preserving the suppression-only safety
-invariant.  Run one dataset with:
+Rectification extension.  The current released experimental implementation is
+SCA-CCRR (`v2_selective_component`), with component-aligned actions,
+multi-level features and a selective quality-veto head.  Run one dataset with:
 
 ```bash
-CCRR_GPU=0 scripts/run_ccrr_v1_threshold_aware.sh
+CCRR_GPU=0 scripts/run_ccrr_v2_selective_component.sh
 ```
 
 For all three datasets, use
-[`scripts/run_ccrr_v1_threshold_aware_all.sh`](scripts/run_ccrr_v1_threshold_aware_all.sh).
-The frozen parameter reference is
-[`configs/ccrr_v1_threshold_aware.yaml`](configs/ccrr_v1_threshold_aware.yaml),
-with FP, missed-target and action-threshold audit tools under `scripts/`.
+[`scripts/run_ccrr_v2_selective_component_all.sh`](scripts/run_ccrr_v2_selective_component_all.sh).
+The parameter reference is
+[`configs/ccrr_v2_selective_component.yaml`](configs/ccrr_v2_selective_component.yaml).
 
 The [CCRR-V2 design guide](Paper1_CCRR_V2_全指标提升方案与代码修改指南.md)
-documents the upper-bound audits and the proposed bidirectional Bi-CCRR path;
-the recovery branch remains a proposal, not part of V1.1.  The
+records the motivation and staged roadmap.  Its SCA phase is implemented; the
+bidirectional Bi-CCRR recovery branch remains a proposal.  V1.1, the
 [V1 safe protocol](README_CCRR_V1.md) and [V0 execution guide](README_CCRR.md)
-are retained as diagnostic records.  Baseline behavior remains the default;
-manual V1.1 invocation requires both `--enable-ccrr` and
-`--ccrr-version v1_threshold_aware`.  Using `--enable-ccrr` alone keeps the
-`v1_safe` default.
+remain reproducibility paths.  Baseline behavior remains the default; pass
+`--enable-ccrr --ccrr-version v2_selective_component` when launching SCA-CCRR
+without the provided runner.
 
 ### SCA-CCRR V2-Enhanced
 
