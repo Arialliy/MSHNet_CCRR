@@ -9,9 +9,14 @@ queue_root="${CCRR_QUEUE_SAVE_ROOT:-${repo_dir}/repro_runs/formal}"
 python_bin="${CCRR_PYTHON:-${resource_repo_dir}/.venv/bin/python}"
 poll_seconds="${CCRR_QUEUE_POLL_SECONDS:-30}"
 gpu_candidates="${CCRR_QUEUE_GPU_CANDIDATES:-0}"
+wait_for_global_lock="${CCRR_QUEUE_WAIT_FOR_GLOBAL_LOCK:-1}"
 
 if [[ ! "${poll_seconds}" =~ ^[1-9][0-9]*$ ]]; then
   echo "CCRR_QUEUE_POLL_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if [[ "${wait_for_global_lock}" != "0" && "${wait_for_global_lock}" != "1" ]]; then
+  echo "CCRR_QUEUE_WAIT_FOR_GLOBAL_LOCK must be 0 or 1" >&2
   exit 2
 fi
 if [[ ! -x "${runner}" ]]; then
@@ -36,24 +41,32 @@ if ! flock -n 8; then
   exit 3
 fi
 
-# The active NUDT runner holds this same lock.  Retain it across both queued
-# datasets so this project never runs two formal datasets concurrently.
-exec 9>"${training_lock}"
-while ! flock -n 9; do
-  echo "[$(date --iso-8601=seconds)] GPU0 NUDT run is active; dataset queue is waiting." >&2
-  sleep "${poll_seconds}"
-done
+# In serial mode, wait for the active formal run and retain its global lock
+# across both queued datasets.  In intentional cross-dataset parallel mode,
+# the queue relies on its per-GPU lock and each child opts into concurrency.
+if [[ "${wait_for_global_lock}" == "1" ]]; then
+  exec 9>"${training_lock}"
+  while ! flock -n 9; do
+    echo "[$(date --iso-8601=seconds)] Another formal run is active; dataset queue is waiting." >&2
+    sleep "${poll_seconds}"
+  done
+else
+  echo "[$(date --iso-8601=seconds)] Cross-dataset parallel mode enabled; using a dedicated physical GPU." >&2
+fi
 
 gpu_is_idle() {
   local gpu="$1"
   local active_pids
-  active_pids="$(
-    nvidia-smi \
-      --id="${gpu}" \
-      --query-compute-apps=pid \
-      --format=csv,noheader,nounits 2>/dev/null \
-      | tr -d '[:space:]'
-  )"
+  if ! active_pids="$(
+      nvidia-smi \
+        --id="${gpu}" \
+        --query-compute-apps=pid \
+        --format=csv,noheader,nounits \
+        | tr -d '[:space:]'
+    )"; then
+    echo "[$(date --iso-8601=seconds)] Failed to query physical GPU ${gpu}; treating it as busy." >&2
+    return 1
+  fi
   [[ -z "${active_pids}" ]]
 }
 
@@ -112,8 +125,8 @@ fi
 wait_for_selected_gpu "${selected_gpu}"
 echo "[$(date --iso-8601=seconds)] Queue assigned to physical GPU ${selected_gpu}." >&2
 
-# After the current NUDT run releases GPU0, run the smaller remaining dataset
-# first; IRSTD starts automatically only after NUAA finishes successfully.
+# Run the smaller remaining dataset first; IRSTD starts automatically only
+# after NUAA finishes successfully on the same selected physical GPU.
 run_dataset NUAA-SIRST "${selected_gpu}"
 wait_for_selected_gpu "${selected_gpu}"
 run_dataset IRSTD-1K "${selected_gpu}"
