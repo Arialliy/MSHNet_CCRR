@@ -90,6 +90,24 @@ records `pareto_status.json` once scheduled evaluation begins.  In an
 independent worktree, `CCRR_RESOURCE_REPO_DIR` may point to the checkout
 containing local datasets, baseline checkpoints and the virtual environment.
 
+The target-safety prototype is available as the separate
+`v2_target_guarded_component` variant.  It adds a high-recall target-presence
+head and a soft-train/hard-evaluation veto without changing the E1--E5 module
+or checkpoint schema.  The first protected-design test keeps Hybrid Pool while disabling
+the previously inconclusive Tail and FP-value terms:
+
+```bash
+CCRR_DATASET_NAME=NUDT-SIRST CCRR_TG_EXPERIMENT=TG1 CCRR_GPU=0 \
+  scripts/run_ccrr_v2_target_guarded.sh
+```
+
+`TG2` additionally places Guard evidence in the risk score, while `TG_FULL`
+matches the full TargetGuard + Tail + FP-value configuration.  See
+[`configs/ccrr_v2_target_guarded.yaml`](configs/ccrr_v2_target_guarded.yaml) and
+[`configs/ccrr_v2_target_guarded_hybrid_guard.yaml`](configs/ccrr_v2_target_guarded_hybrid_guard.yaml).
+TargetGuard Pareto selection additionally requires zero target deletion and at
+least 0.99 Guard recall.
+
 The base SCA-CCRR V2 remains reproducible through
 `scripts/run_ccrr_v2_selective_component.sh`; V1.1, the
 [V1 safe protocol](README_CCRR_V1.md) and [V0 execution guide](README_CCRR.md)

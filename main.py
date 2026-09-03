@@ -37,6 +37,7 @@ from model.candidate_loss import (
     CandidateBinaryFocalLoss,
     CandidateRankLoss,
     CCRRLoss,
+    TargetGuardLoss,
     TargetQualityLoss,
 )
 from model.loss import AverageMeter, SLSIoULoss
@@ -69,6 +70,11 @@ from utils.reliability_metric import (
 CANDIDATE_BANK_SCHEMA_VERSION = "mshnet-ccrr-candidate-bank/v1"
 WEIGHT_SCHEMA_VERSION = "mshnet-ccrr-weight/v2-safe"
 SCA_WEIGHT_SCHEMA_VERSION = "mshnet-sca-ccrr-weight/v1"
+TARGET_GUARDED_SCA_WEIGHT_SCHEMA_VERSION = "mshnet-tg-sca-ccrr-weight/v1"
+SCA_VERSIONS = frozenset(
+    ("v2_selective_component", "v2_target_guarded_component")
+)
+TARGET_GUARDED_VERSION = "v2_target_guarded_component"
 LEGACY_OPTIONAL_CONFIG_DEFAULTS: dict[str, Any] = {
     "candidate_pooling": "avg",
     "candidate_topk_ratio": 0.125,
@@ -82,6 +88,14 @@ LEGACY_OPTIONAL_CONFIG_DEFAULTS: dict[str, Any] = {
     "training_config.fp_value_max": 3.0,
     "training_config.save_best_pareto": False,
 }
+
+
+def _is_sca_version(version: str) -> bool:
+    return str(version) in SCA_VERSIONS
+
+
+def _is_target_guarded_version(version: str) -> bool:
+    return str(version) == TARGET_GUARDED_VERSION
 
 
 def str2bool(value: Any) -> bool:
@@ -134,12 +148,18 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--ccrr-version",
-        choices=("v1_safe", "v1_threshold_aware", "v2_selective_component"),
+        choices=(
+            "v1_safe",
+            "v1_threshold_aware",
+            "v2_selective_component",
+            TARGET_GUARDED_VERSION,
+        ),
         default="v1_safe",
         help=(
             "Keep v1_safe for exact historical reproduction; use "
             "v1_threshold_aware for the audited V1.1 action executor; use "
-            "v2_selective_component for component-aligned quality-veto SCA-CCRR."
+            "v2_selective_component for component-aligned quality-veto SCA-CCRR; "
+            "v2_target_guarded_component adds an independent target-presence veto."
         ),
     )
     parser.add_argument("--candidate-bank", default="")
@@ -195,6 +215,10 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     parser.add_argument("--risk-threshold", type=float, default=2.0)
     parser.add_argument("--quality-veto-threshold", type=float, default=0.20)
     parser.add_argument("--risk-alpha", type=float, default=1.0)
+    parser.add_argument("--guard-veto-threshold", type=float, default=0.20)
+    parser.add_argument("--guard-alpha", type=float, default=1.0)
+    parser.add_argument("--quality-temperature", type=float, default=0.05)
+    parser.add_argument("--guard-temperature", type=float, default=0.05)
     parser.add_argument("--ccrr-lr", type=float, default=3e-4)
     parser.add_argument("--backbone-lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
@@ -221,6 +245,10 @@ def parse_args(default_mode: str | None = None) -> argparse.Namespace:
     parser.add_argument("--lambda-quality", type=float, default=1.0)
     parser.add_argument("--lambda-action-risk", type=float, default=1.0)
     parser.add_argument("--lambda-rank", type=float, default=0.1)
+    parser.add_argument("--lambda-target-guard", type=float, default=2.0)
+    parser.add_argument("--target-guard-positive-weight", type=float, default=4.0)
+    parser.add_argument("--target-guard-fn-weight", type=float, default=2.0)
+    parser.add_argument("--target-guard-tail-temperature", type=float, default=0.1)
     parser.add_argument("--target-harm-weight", type=float, default=20.0)
     parser.add_argument("--missed-clutter-weight", type=float, default=1.0)
     parser.add_argument("--target-tail-weight", type=float, default=0.0)
@@ -548,6 +576,93 @@ def _fp_value_weights_for_risk(
     """Select the exact legacy mean path when FP value weighting is disabled."""
 
     return weights if float(beta) > 0.0 else None
+
+
+def _target_guard_diagnostics(
+    records: list[Mapping[str, Any]], *, guard_veto_threshold: float
+) -> dict[str, Any]:
+    """Aggregate Guard safety/over-protection from candidate-level evidence."""
+
+    threshold = float(guard_veto_threshold)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("guard_veto_threshold must lie in [0,1]")
+    valid = [record for record in records if record.get("guard_valid", False)]
+    positive = [
+        record
+        for record in valid
+        if float(record.get("target_guard_gt", 0.0)) > 0.5
+    ]
+    safe_fp = [
+        record
+        for record in valid
+        if float(record.get("target_guard_gt", 0.0)) <= 0.5
+        and not record.get("is_ambiguous", False)
+    ]
+
+    def protected(record: Mapping[str, Any]) -> bool:
+        value = float(record["target_guard"])
+        if not math.isfinite(value):
+            raise ValueError("target_guard evidence must be finite")
+        return value > threshold
+
+    positive_protected = [record for record in positive if protected(record)]
+    fp_overprotected = [record for record in safe_fp if protected(record)]
+
+    def ratio(numerator: int, denominator: int) -> float:
+        return float(numerator / denominator) if denominator else float("nan")
+
+    return {
+        "guard_veto_threshold": threshold,
+        "num_valid": len(valid),
+        "num_positive": len(positive),
+        "num_false_positive_components": len(safe_fp),
+        "num_positive_protected": len(positive_protected),
+        "num_positive_unprotected": len(positive) - len(positive_protected),
+        "num_fp_overprotected": len(fp_overprotected),
+        "target_guard_recall": ratio(len(positive_protected), len(positive)),
+        "target_guard_fp_protection_rate": ratio(
+            len(fp_overprotected), len(safe_fp)
+        ),
+    }
+
+
+def _target_guard_pareto_constraints(
+    base_constraints: Mapping[str, bool],
+    detection_transitions: Mapping[str, Any],
+    candidate_records: list[Mapping[str, Any]],
+    guard_diagnostics: Mapping[str, Any],
+    *,
+    minimum_guard_recall: float = 0.99,
+) -> dict[str, bool]:
+    """Extend non-inferiority with destructive-action safety constraints."""
+
+    if "coarse_detected_refined_missed_targets" not in detection_transitions:
+        raise KeyError("missing coarse-to-refined target-deletion transition")
+    missing_candidate_evidence = [
+        index
+        for index, record in enumerate(candidate_records)
+        if "target_component_eliminated" not in record
+    ]
+    if missing_candidate_evidence:
+        raise ValueError(
+            "candidate records lack target-deletion evidence at indices "
+            + ", ".join(str(index) for index in missing_candidate_evidence[:5])
+        )
+    transition_deletions = int(
+        detection_transitions["coarse_detected_refined_missed_targets"]
+    )
+    if transition_deletions < 0:
+        raise ValueError("target-deletion transition count must be non-negative")
+    guard_recall = float(guard_diagnostics["target_guard_recall"])
+    constraints = dict(base_constraints)
+    constraints["target_deletion_zero"] = transition_deletions == 0 and not any(
+        bool(record["target_component_eliminated"])
+        for record in candidate_records
+    )
+    constraints["target_guard_recall_at_least_0_99"] = (
+        math.isfinite(guard_recall) and guard_recall >= minimum_guard_recall
+    )
+    return constraints
 
 
 def _detection_transition_counts(
@@ -1048,9 +1163,9 @@ class Trainer:
 
         ccrr_config = None
         if args.enable_ccrr:
-            if args.ccrr_version == "v2_selective_component":
+            if _is_sca_version(args.ccrr_version):
                 ccrr_config = {
-                    "variant": "v2_selective_component",
+                    "variant": args.ccrr_version,
                     "feature_channels": args.sca_feature_channels,
                     "num_scales": 4,
                     "roi_size": args.sca_roi_size,
@@ -1068,6 +1183,15 @@ class Trainer:
                     "remove_threshold": args.clutter_peak_ceiling,
                     "output_threshold": 0.5,
                 }
+                if _is_target_guarded_version(args.ccrr_version):
+                    ccrr_config.update(
+                        {
+                            "guard_veto_threshold": args.guard_veto_threshold,
+                            "guard_alpha": args.guard_alpha,
+                            "quality_temperature": args.quality_temperature,
+                            "guard_temperature": args.guard_temperature,
+                        }
+                    )
             else:
                 ccrr_config = {
                     "num_scales": 4,
@@ -1113,7 +1237,8 @@ class Trainer:
         self.sca_quality_loss: TargetQualityLoss | None = None
         self.sca_risk_loss: AsymmetricActionRiskLoss | None = None
         self.sca_rank_loss: CandidateRankLoss | None = None
-        if args.enable_ccrr and args.ccrr_version == "v2_selective_component":
+        self.target_guard_loss: TargetGuardLoss | None = None
+        if args.enable_ccrr and _is_sca_version(args.ccrr_version):
             self.sca_clutter_loss = CandidateBinaryFocalLoss(
                 gamma=args.clutter_focal_gamma,
                 positive_alpha=args.clutter_positive_alpha,
@@ -1127,6 +1252,12 @@ class Trainer:
                 target_tail_temperature=args.target_tail_temperature,
             )
             self.sca_rank_loss = CandidateRankLoss(margin=args.rank_margin)
+            if _is_target_guarded_version(args.ccrr_version):
+                self.target_guard_loss = TargetGuardLoss(
+                    positive_weight=args.target_guard_positive_weight,
+                    false_negative_weight=args.target_guard_fn_weight,
+                    tail_temperature=args.target_guard_tail_temperature,
+                )
             args.resolved_candidate_class_weights = []
         elif args.enable_ccrr:
             if args.ccrr_version == "v1_threshold_aware":
@@ -1250,6 +1381,38 @@ class Trainer:
             raise ValueError("--quality-veto-threshold must lie in [0,1]")
         if not math.isfinite(self.args.risk_alpha) or self.args.risk_alpha < 0:
             raise ValueError("--risk-alpha must be finite and non-negative")
+        if _is_target_guarded_version(self.args.ccrr_version):
+            if not 0.0 <= self.args.guard_veto_threshold <= 1.0:
+                raise ValueError("--guard-veto-threshold must lie in [0,1]")
+            if not math.isfinite(self.args.guard_alpha) or self.args.guard_alpha < 0:
+                raise ValueError("--guard-alpha must be finite and non-negative")
+            for name in ("quality_temperature", "guard_temperature"):
+                value = float(getattr(self.args, name))
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(
+                        f"--{name.replace('_', '-')} must be finite and positive"
+                    )
+            if (
+                not math.isfinite(self.args.target_guard_positive_weight)
+                or self.args.target_guard_positive_weight <= 0
+            ):
+                raise ValueError(
+                    "--target-guard-positive-weight must be finite and positive"
+                )
+            if (
+                not math.isfinite(self.args.target_guard_fn_weight)
+                or self.args.target_guard_fn_weight < 0
+            ):
+                raise ValueError(
+                    "--target-guard-fn-weight must be finite and non-negative"
+                )
+            if (
+                not math.isfinite(self.args.target_guard_tail_temperature)
+                or self.args.target_guard_tail_temperature <= 0
+            ):
+                raise ValueError(
+                    "--target-guard-tail-temperature must be finite and positive"
+                )
         if not 0.0 <= self.args.quality_iou_weight <= 1.0:
             raise ValueError("--quality-iou-weight must lie in [0,1]")
         if not math.isfinite(self.args.quality_center_sigma) or self.args.quality_center_sigma <= 0:
@@ -1290,27 +1453,28 @@ class Trainer:
                     "v1_threshold_aware uses online candidates; omit "
                     "--candidate-bank and --test-candidate-bank"
                 )
-        if self.args.enable_ccrr and self.args.ccrr_version == "v2_selective_component":
+        if self.args.enable_ccrr and _is_sca_version(self.args.ccrr_version):
+            version = self.args.ccrr_version
             if self.args.ccrr_num_classes != 2:
-                raise ValueError("v2_selective_component requires --ccrr-num-classes 2")
+                raise ValueError(f"{version} requires --ccrr-num-classes 2")
             if self.args.candidate_bank or self.args.test_candidate_bank:
                 raise ValueError(
-                    "v2_selective_component uses online component-aligned candidates; "
+                    f"{version} uses online component-aligned candidates; "
                     "omit --candidate-bank and --test-candidate-bank"
                 )
             if not math.isclose(self.args.candidate_threshold, 0.2, abs_tol=1e-12):
-                raise ValueError("v2_selective_component fixes --candidate-threshold at 0.2")
+                raise ValueError(f"{version} fixes --candidate-threshold at 0.2")
             if not 0.0 < self.args.clutter_peak_ceiling < 0.5:
                 raise ValueError(
-                    "v2_selective_component requires --remove-threshold in (0,0.5)"
+                    f"{version} requires --remove-threshold in (0,0.5)"
                 )
         if self.args.save_best_pareto and (
             not self.args.enable_ccrr
-            or self.args.ccrr_version != "v2_selective_component"
+            or not _is_sca_version(self.args.ccrr_version)
         ):
             raise ValueError(
                 "--save-best-pareto requires --enable-ccrr with "
-                "--ccrr-version v2_selective_component"
+                "a component-aligned SCA version"
             )
         if (
             self.args.mode == "train"
@@ -1337,6 +1501,11 @@ class Trainer:
         ):
             if getattr(self.args, name) < 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
+        if (
+            _is_target_guarded_version(self.args.ccrr_version)
+            and self.args.lambda_target_guard < 0
+        ):
+            raise ValueError("--lambda-target-guard must be non-negative")
 
     @staticmethod
     def _select_device(requested: str) -> torch.device:
@@ -1357,7 +1526,11 @@ class Trainer:
         return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
     def _weight_schema_version(self) -> str:
-        if self.args.enable_ccrr and self.args.ccrr_version == "v2_selective_component":
+        if self.args.enable_ccrr and _is_target_guarded_version(
+            self.args.ccrr_version
+        ):
+            return TARGET_GUARDED_SCA_WEIGHT_SCHEMA_VERSION
+        if self.args.enable_ccrr and _is_sca_version(self.args.ccrr_version):
             return SCA_WEIGHT_SCHEMA_VERSION
         return WEIGHT_SCHEMA_VERSION
 
@@ -1379,9 +1552,12 @@ class Trainer:
         config: dict[str, Any] = {
             "schema_version": "mshnet-ccrr-inference/v2-safe",
             "model_variant": (
-                "MSHNet+SCA-CCRR"
+                "MSHNet+TG-SCA-CCRR"
                 if self.args.enable_ccrr
-                and self.args.ccrr_version == "v2_selective_component"
+                and _is_target_guarded_version(self.args.ccrr_version)
+                else "MSHNet+SCA-CCRR"
+                if self.args.enable_ccrr
+                and _is_sca_version(self.args.ccrr_version)
                 else "MSHNet+CCRR"
                 if self.args.enable_ccrr
                 else "MSHNet"
@@ -1403,7 +1579,7 @@ class Trainer:
                     "max_candidate_area": int(self.args.max_candidate_area),
                     "roi_size": int(
                         self.args.sca_roi_size
-                        if self.args.ccrr_version == "v2_selective_component"
+                        if _is_sca_version(self.args.ccrr_version)
                         else self.args.roi_size
                     ),
                     "hidden_dim": int(self.args.hidden_dim),
@@ -1439,11 +1615,15 @@ class Trainer:
                         "output_probability_threshold": 0.5,
                     }
                 )
-            elif self.args.ccrr_version == "v2_selective_component":
+            elif _is_sca_version(self.args.ccrr_version):
                 config.update(
                     {
-                        "schema_version": "mshnet-sca-ccrr-inference/v1",
-                        "ccrr_version": "v2_selective_component",
+                        "schema_version": (
+                            "mshnet-tg-sca-ccrr-inference/v1"
+                            if _is_target_guarded_version(self.args.ccrr_version)
+                            else "mshnet-sca-ccrr-inference/v1"
+                        ),
+                        "ccrr_version": self.args.ccrr_version,
                         "ccrr_feature_channels": int(
                             self.args.sca_feature_channels
                         ),
@@ -1485,6 +1665,22 @@ class Trainer:
                         "default_action": "keep",
                     }
                 )
+                if _is_target_guarded_version(self.args.ccrr_version):
+                    config.update(
+                        {
+                            "target_guarded": True,
+                            "guard_veto_threshold": float(
+                                self.args.guard_veto_threshold
+                            ),
+                            "guard_alpha": float(self.args.guard_alpha),
+                            "quality_temperature": float(
+                                self.args.quality_temperature
+                            ),
+                            "guard_temperature": float(
+                                self.args.guard_temperature
+                            ),
+                        }
+                    )
         return config
 
     def _evaluation_config(self) -> dict[str, Any]:
@@ -1511,7 +1707,7 @@ class Trainer:
             )
             if self.args.ccrr_version in (
                 "v1_threshold_aware",
-                "v2_selective_component",
+                *SCA_VERSIONS,
             ):
                 test_source = self.test_loader.dataset
                 if isinstance(test_source, Data.Subset):
@@ -1526,11 +1722,15 @@ class Trainer:
                         ),
                     }
                 )
-            if self.args.ccrr_version == "v2_selective_component":
+            if _is_sca_version(self.args.ccrr_version):
                 config.update(
                     {
-                        "schema_version": "mshnet-sca-ccrr-evaluation/v1",
-                        "ccrr_version": "v2_selective_component",
+                        "schema_version": (
+                            "mshnet-tg-sca-ccrr-evaluation/v1"
+                            if _is_target_guarded_version(self.args.ccrr_version)
+                            else "mshnet-sca-ccrr-evaluation/v1"
+                        ),
+                        "ccrr_version": self.args.ccrr_version,
                         "component_label_source": "exact_action_mask",
                         "component_matching": (
                             "8_connected_maximum_cardinality_centroid"
@@ -1622,7 +1822,7 @@ class Trainer:
                         ),
                     }
                 )
-            elif self.args.ccrr_version == "v2_selective_component":
+            elif _is_sca_version(self.args.ccrr_version):
                 train_source = (
                     self.train_loader.dataset
                     if self.train_loader is not None
@@ -1637,8 +1837,12 @@ class Trainer:
                     )
                 config.update(
                     {
-                        "schema_version": "mshnet-sca-ccrr-training/v1",
-                        "ccrr_version": "v2_selective_component",
+                        "schema_version": (
+                            "mshnet-tg-sca-ccrr-training/v1"
+                            if _is_target_guarded_version(self.args.ccrr_version)
+                            else "mshnet-sca-ccrr-training/v1"
+                        ),
+                        "ccrr_version": self.args.ccrr_version,
                         "training_label_mode": (
                             "exact_component_shared_evaluation_matching"
                         ),
@@ -1714,6 +1918,37 @@ class Trainer:
                         "trainable_prefixes": trainable_prefixes,
                     }
                 )
+                if _is_target_guarded_version(self.args.ccrr_version):
+                    config.update(
+                        {
+                            "guard_label_mode": (
+                                "target_or_ambiguous_is_protected"
+                            ),
+                            "guard_loss": "high_recall_bce_fn_tail",
+                            "guard_veto_threshold": float(
+                                self.args.guard_veto_threshold
+                            ),
+                            "guard_alpha": float(self.args.guard_alpha),
+                            "quality_temperature": float(
+                                self.args.quality_temperature
+                            ),
+                            "guard_temperature": float(
+                                self.args.guard_temperature
+                            ),
+                            "lambda_target_guard": float(
+                                self.args.lambda_target_guard
+                            ),
+                            "target_guard_positive_weight": float(
+                                self.args.target_guard_positive_weight
+                            ),
+                            "target_guard_fn_weight": float(
+                                self.args.target_guard_fn_weight
+                            ),
+                            "target_guard_tail_temperature": float(
+                                self.args.target_guard_tail_temperature
+                            ),
+                        }
+                    )
         return config
 
     @staticmethod
@@ -2112,13 +2347,13 @@ class Trainer:
             return
         if self.args.ccrr_stage == "head_only":
             trainable_prefixes = ("ccrr.",)
-            if self.args.ccrr_version == "v2_selective_component":
+            if _is_sca_version(self.args.ccrr_version):
                 trainable_prefixes += ("ccrr_feature_adapter.",)
             for name, parameter in self._state_model().named_parameters():
                 parameter.requires_grad = name.startswith(trainable_prefixes)
             return
         trainable_prefixes = ("ccrr.", "decoder_0.", "output_0.", "final.")
-        if self.args.ccrr_version == "v2_selective_component":
+        if _is_sca_version(self.args.ccrr_version):
             trainable_prefixes += ("ccrr_feature_adapter.",)
         for name, parameter in self._state_model().named_parameters():
             parameter.requires_grad = name.startswith(trainable_prefixes)
@@ -2131,7 +2366,7 @@ class Trainer:
             )
         named_parameters = list(self._state_model().named_parameters())
         head_prefixes = ("ccrr.",)
-        if self.args.ccrr_version == "v2_selective_component":
+        if _is_sca_version(self.args.ccrr_version):
             head_prefixes += ("ccrr_feature_adapter.",)
         ccrr_parameters = [
             parameter
@@ -2181,7 +2416,7 @@ class Trainer:
         return inverse.tolist()
 
     def _candidate_score(self, candidates: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        if getattr(self.args, "ccrr_version", "v1_safe") == "v2_selective_component":
+        if _is_sca_version(getattr(self.args, "ccrr_version", "v1_safe")):
             key = {
                 "coarse_peak": "coarse_peak_scores",
                 "coarse_mean": "coarse_mean_scores",
@@ -2336,7 +2571,7 @@ class Trainer:
             fp_value_weights,
             torch.ones_like(fp_value_weights),
         )
-        return {
+        matching = {
             "labels": strict_labels,
             "strict_labels": strict_labels,
             "training_labels": training_labels,
@@ -2355,11 +2590,25 @@ class Trainer:
             "is_target_component": is_target_component,
             "is_fp_component": is_fp_component,
         }
+        if _is_target_guarded_version(
+            getattr(self.args, "ccrr_version", "v1_safe")
+        ):
+            matching.update(
+                {
+                    "target_guard_gt": (
+                        (strict_labels == TARGET_LABEL) | ambiguous
+                    ).to(dtype=torch.float32),
+                    "guard_valid": (
+                        is_target_component | is_fp_component | ambiguous
+                    ),
+                }
+            )
+        return matching
 
     def _label_candidates(
         self, candidates: Mapping[str, torch.Tensor], labels: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        if getattr(self.args, "ccrr_version", "v1_safe") == "v2_selective_component":
+        if _is_sca_version(getattr(self.args, "ccrr_version", "v1_safe")):
             return self._label_sca_candidates(candidates, labels)
         masks = candidates.get("masks", candidates.get("candidate_masks"))
         if masks is None:
@@ -2438,7 +2687,7 @@ class Trainer:
             if state_model.ccrr is None:
                 raise RuntimeError("CCRR module is unavailable")
             state_model.ccrr.train()
-            if self.args.ccrr_version == "v2_selective_component":
+            if _is_sca_version(self.args.ccrr_version):
                 if state_model.ccrr_feature_adapter is None:
                     raise RuntimeError("SCA feature adapter is unavailable")
                 state_model.ccrr_feature_adapter.train()
@@ -2446,23 +2695,38 @@ class Trainer:
                 state_model.decoder_0.train()
                 state_model.output_0.train()
                 state_model.final.train()
-        meters = {
-            name: AverageMeter()
-            for name in (
-                "total",
-                "coarse",
-                "refined",
-                "classification",
-                "calibration",
-                "preservation",
-                "quality",
-                "action_risk",
-                "target_harm",
-                "target_tail",
-                "missed_clutter",
-                "mean_fp_value_weight",
-                "rank",
+        meter_names = [
+            "total",
+            "coarse",
+            "refined",
+            "classification",
+            "calibration",
+            "preservation",
+            "quality",
+            "action_risk",
+            "target_harm",
+            "target_tail",
+            "missed_clutter",
+            "mean_fp_value_weight",
+            "rank",
+        ]
+        if _is_target_guarded_version(self.args.ccrr_version):
+            meter_names.extend(
+                [
+                    "target_guard",
+                    "target_guard_bce",
+                    "target_guard_false_negative",
+                    "target_guard_tail_false_negative",
+                    "target_guard_recall",
+                    "target_guard_fp_protection_rate",
+                ]
             )
+        meters = {name: AverageMeter() for name in meter_names}
+        guard_counts = {
+            "positive": 0,
+            "positive_protected": 0,
+            "safe_fp": 0,
+            "safe_fp_protected": 0,
         }
         maximum = self.args.max_train_batches or len(self.train_loader)
         progress = tqdm(self.train_loader, total=min(len(self.train_loader), maximum))
@@ -2489,7 +2753,7 @@ class Trainer:
                     outputs["refined_logits"], labels, self.warm_epoch, epoch
                 )
                 candidate_outputs = outputs["candidate_outputs"]
-                if self.args.ccrr_version == "v2_selective_component":
+                if _is_sca_version(self.args.ccrr_version):
                     if any(
                         loss is None
                         for loss in (
@@ -2535,6 +2799,45 @@ class Trainer:
                         ],
                         "rank": rank,
                     }
+                    guard_total = classification.sum() * 0.0
+                    if _is_target_guarded_version(self.args.ccrr_version):
+                        if self.target_guard_loss is None:
+                            raise RuntimeError("Target Guard loss state is unavailable")
+                        guard_terms = self.target_guard_loss(
+                            candidate_outputs["target_guard_logits"],
+                            matching["target_guard_gt"],
+                            matching["guard_valid"],
+                        )
+                        guard_total = guard_terms["total"]
+                        guard_probability = candidate_outputs["target_guard"]
+                        guard_positive = (
+                            matching["guard_valid"]
+                            & (matching["target_guard_gt"] > 0.5)
+                        )
+                        safe_fp = matching["is_fp_component"]
+                        protected = (
+                            guard_probability > self.args.guard_veto_threshold
+                        )
+                        guard_counts["positive"] += int(guard_positive.sum().item())
+                        guard_counts["positive_protected"] += int(
+                            (protected & guard_positive).sum().item()
+                        )
+                        guard_counts["safe_fp"] += int(safe_fp.sum().item())
+                        guard_counts["safe_fp_protected"] += int(
+                            (protected & safe_fp).sum().item()
+                        )
+                        terms.update(
+                            {
+                                "target_guard": guard_total,
+                                "target_guard_bce": guard_terms["bce"],
+                                "target_guard_false_negative": guard_terms[
+                                    "false_negative"
+                                ],
+                                "target_guard_tail_false_negative": guard_terms[
+                                    "tail_false_negative"
+                                ],
+                            }
+                        )
                     total_loss = (
                         coarse_loss
                         + self.args.lambda_refined * refined_loss
@@ -2542,6 +2845,7 @@ class Trainer:
                         + self.args.lambda_quality * quality
                         + self.args.lambda_action_risk * risk_terms["total"]
                         + self.args.lambda_rank * rank
+                        + getattr(self.args, "lambda_target_guard", 0.0) * guard_total
                     )
                 else:
                     if self.ccrr_loss is None:
@@ -2575,7 +2879,19 @@ class Trainer:
             progress.set_description(
                 f"Epoch {epoch}, loss {meters['total'].avg:.4f}"
             )
-        return {name: float(meter.avg) for name, meter in meters.items()}
+        result = {name: float(meter.avg) for name, meter in meters.items()}
+        if _is_target_guarded_version(self.args.ccrr_version):
+            result["target_guard_recall"] = (
+                guard_counts["positive_protected"] / guard_counts["positive"]
+                if guard_counts["positive"]
+                else float("nan")
+            )
+            result["target_guard_fp_protection_rate"] = (
+                guard_counts["safe_fp_protected"] / guard_counts["safe_fp"]
+                if guard_counts["safe_fp"]
+                else float("nan")
+            )
+        return result
 
     @staticmethod
     def _count_gt_instances(labels: torch.Tensor) -> int:
@@ -2664,7 +2980,7 @@ class Trainer:
                     batch_indices_tensor = matching["batch_indices"]
                     candidate_masks_tensor = candidate_outputs[
                         "action_masks"
-                        if self.args.ccrr_version == "v2_selective_component"
+                        if _is_sca_version(self.args.ccrr_version)
                         else "candidate_masks"
                     ].bool()
                     coarse_candidate_probabilities = outputs[
@@ -2720,7 +3036,7 @@ class Trainer:
                             "coarse_detected": coarse_detected,
                             "refined_detected": refined_detected,
                         }
-                        if self.args.ccrr_version == "v2_selective_component":
+                        if _is_sca_version(self.args.ccrr_version):
                             record.update(
                                 {
                                     "proposal_id": int(
@@ -2782,9 +3098,103 @@ class Trainer:
                                     ),
                                 }
                             )
+                            if _is_target_guarded_version(self.args.ccrr_version):
+                                action_coordinates = torch.nonzero(
+                                    candidate_masks_tensor[index], as_tuple=False
+                                )
+                                quality_allow = bool(
+                                    candidate_outputs["quality_veto"][index].item()
+                                )
+                                guard_allow = bool(
+                                    candidate_outputs["guard_veto"][index].item()
+                                )
+                                risk_allow = bool(
+                                    candidate_outputs["risk_score"][index].item()
+                                    >= self.args.risk_threshold
+                                )
+                                protected_by = []
+                                if not risk_allow:
+                                    protected_by.append("risk")
+                                if not quality_allow:
+                                    protected_by.append("target_quality")
+                                if not guard_allow:
+                                    protected_by.append("target_guard")
+                                record.update(
+                                    {
+                                        "target_guard": float(
+                                            candidate_outputs["target_guard"][
+                                                index
+                                            ].item()
+                                        ),
+                                        "target_guard_gt": float(
+                                            matching["target_guard_gt"][index].item()
+                                        ),
+                                        "guard_valid": bool(
+                                            matching["guard_valid"][index].item()
+                                        ),
+                                        "guard_allow": guard_allow,
+                                        "quality_allow": quality_allow,
+                                        "soft_guard_allow": float(
+                                            candidate_outputs[
+                                                "soft_guard_allow"
+                                            ][index].item()
+                                        ),
+                                        "soft_quality_allow": float(
+                                            candidate_outputs[
+                                                "soft_quality_allow"
+                                            ][index].item()
+                                        ),
+                                        "final_gate": float(
+                                            gates_tensor[index].item()
+                                        ),
+                                        "protected_by": protected_by,
+                                        "scale_features": [
+                                            float(value)
+                                            for value in candidate_outputs[
+                                                "scale_features"
+                                            ][index].detach().cpu().tolist()
+                                        ],
+                                        "geometry_features": [
+                                            float(value)
+                                            for value in candidate_outputs[
+                                                "geometry_features"
+                                            ][index].detach().cpu().tolist()
+                                        ],
+                                        "proposal_relation_feature_norm": float(
+                                            candidate_outputs[
+                                                "proposal_relation_features"
+                                            ][index].detach().norm().item()
+                                        ),
+                                        "action_mask_feature_norm": float(
+                                            candidate_outputs[
+                                                "action_mask_features"
+                                            ][index].detach().norm().item()
+                                        ),
+                                        "proposal_box_xyxy": [
+                                            float(value)
+                                            for value in candidate_outputs[
+                                                "proposal_boxes"
+                                            ][index, 1:].detach().cpu().tolist()
+                                        ],
+                                        "action_box_xyxy": [
+                                            float(value)
+                                            for value in candidate_outputs[
+                                                "action_boxes"
+                                            ][index, 1:].detach().cpu().tolist()
+                                        ],
+                                        "action_centroid_yx": [
+                                            float(value)
+                                            for value in action_coordinates.float()
+                                            .mean(dim=0)
+                                            .detach()
+                                            .cpu()
+                                            .tolist()
+                                        ],
+                                    }
+                                )
                         if self.args.ccrr_version in (
                             "v1_threshold_aware",
-                            "v2_selective_component",
+                            *SCA_VERSIONS,
                         ):
                             positive_support = (
                                 candidate_masks_tensor[index]
@@ -2820,21 +3230,18 @@ class Trainer:
                                     ),
                                     "is_target": bool(
                                         strict_labels[index] == TARGET_LABEL
-                                        if self.args.ccrr_version
-                                        == "v2_selective_component"
+                                        if _is_sca_version(self.args.ccrr_version)
                                         else train_labels[index]
                                         == TARGET_LABEL
                                     ),
                                     "is_clutter": bool(
                                         strict_labels[index] == CLUTTER_LABEL
-                                        if self.args.ccrr_version
-                                        == "v2_selective_component"
+                                        if _is_sca_version(self.args.ccrr_version)
                                         else train_labels[index]
                                         == CLUTTER_LABEL
                                     ),
                                     "is_ambiguous": bool(
-                                        self.args.ccrr_version
-                                        == "v2_selective_component"
+                                        _is_sca_version(self.args.ccrr_version)
                                         and train_labels[index] == -1
                                     ),
                                     "component_eliminated": bool(
@@ -2843,8 +3250,7 @@ class Trainer:
                                     "target_component_eliminated": bool(
                                         (
                                             strict_labels[index]
-                                            if self.args.ccrr_version
-                                            == "v2_selective_component"
+                                            if _is_sca_version(self.args.ccrr_version)
                                             else train_labels[index]
                                         )
                                         == TARGET_LABEL
@@ -3109,7 +3515,7 @@ class Trainer:
                     else np.empty((0,), dtype=np.int64),
                     (
                         None
-                        if self.args.ccrr_version == "v2_selective_component"
+                        if _is_sca_version(self.args.ccrr_version)
                         or (
                             self.args.ccrr_version == "v1_threshold_aware"
                             and self.args.max_action_suppression == 0
@@ -3144,7 +3550,7 @@ class Trainer:
             }
             if self.args.ccrr_version in (
                 "v1_threshold_aware",
-                "v2_selective_component",
+                *SCA_VERSIONS,
             ):
                 actions = [
                     record
@@ -3194,22 +3600,22 @@ class Trainer:
                 action_operating_point = {
                     "action_score": (
                         "selective_risk"
-                        if self.args.ccrr_version == "v2_selective_component"
+                        if _is_sca_version(self.args.ccrr_version)
                         else "clutter_probability"
                     ),
                     "clutter_action_threshold": (
                         None
-                        if self.args.ccrr_version == "v2_selective_component"
+                        if _is_sca_version(self.args.ccrr_version)
                         else float(self.args.clutter_action_threshold)
                     ),
                     "risk_threshold": (
                         float(self.args.risk_threshold)
-                        if self.args.ccrr_version == "v2_selective_component"
+                        if _is_sca_version(self.args.ccrr_version)
                         else None
                     ),
                     "quality_veto_threshold": (
                         float(self.args.quality_veto_threshold)
-                        if self.args.ccrr_version == "v2_selective_component"
+                        if _is_sca_version(self.args.ccrr_version)
                         else None
                     ),
                     "remove_threshold": float(
@@ -3248,10 +3654,29 @@ class Trainer:
                     ),
                     "component_transitions": dict(detection_transitions),
                 }
+                if _is_target_guarded_version(self.args.ccrr_version):
+                    guard_diagnostics = _target_guard_diagnostics(
+                        candidate_records,
+                        guard_veto_threshold=self.args.guard_veto_threshold,
+                    )
+                    action_operating_point.update(
+                        {
+                            "guard_veto_threshold": float(
+                                self.args.guard_veto_threshold
+                            ),
+                            "target_guard_recall": guard_diagnostics[
+                                "target_guard_recall"
+                            ],
+                            "target_guard_fp_protection_rate": guard_diagnostics[
+                                "target_guard_fp_protection_rate"
+                            ],
+                        }
+                    )
+                    metrics["candidate"]["target_guard"] = guard_diagnostics
                 metrics["candidate"]["action_operating_point"] = (
                     action_operating_point
                 )
-                if self.args.ccrr_version == "v2_selective_component":
+                if _is_sca_version(self.args.ccrr_version):
                     metrics["candidate"]["enhanced_diagnostics"] = (
                         _sca_enhanced_diagnostics(
                             candidate_records,
@@ -3319,6 +3744,15 @@ class Trainer:
                             >= float(coarse_summary["nIoU"])
                         ),
                     }
+                    if _is_target_guarded_version(self.args.ccrr_version):
+                        guard_recall = float(
+                            metrics["candidate"]["target_guard"][
+                                "target_guard_recall"
+                            ]
+                        )
+                        sca_gate["target_guard_recall_at_least_0_99"] = (
+                            math.isfinite(guard_recall) and guard_recall >= 0.99
+                        )
                     sca_gate["go"] = all(sca_gate.values())
                     metrics["candidate"]["sca_gate"] = {
                         **sca_gate,
@@ -3358,13 +3792,20 @@ class Trainer:
             pareto_reason: str | None = None
             if (
                 self.args.enable_ccrr
-                and self.args.ccrr_version == "v2_selective_component"
+                and _is_sca_version(self.args.ccrr_version)
             ):
                 try:
                     pareto_constraint_state = pareto_constraints(
                         coarse_summary,
                         refined_summary,
                     )
+                    if _is_target_guarded_version(self.args.ccrr_version):
+                        pareto_constraint_state = _target_guard_pareto_constraints(
+                            pareto_constraint_state,
+                            detection_transitions,
+                            candidate_records,
+                            metrics["candidate"]["target_guard"],
+                        )
                     pareto_feasible = all(pareto_constraint_state.values())
                     if pareto_feasible:
                         current_pareto_key = pareto_key(refined_summary)
@@ -3415,6 +3856,20 @@ class Trainer:
                         "coarse": dict(coarse_summary),
                         "refined": dict(refined_summary),
                     }
+                    if _is_target_guarded_version(self.args.ccrr_version):
+                        artifact["selection_details"].update(
+                            {
+                                "target_guard": dict(
+                                    metrics["candidate"]["target_guard"]
+                                ),
+                                "component_transitions": dict(
+                                    detection_transitions
+                                ),
+                                "sca_gate": dict(
+                                    metrics["candidate"]["sca_gate"]
+                                ),
+                            }
+                        )
                     torch.save(
                         artifact,
                         osp.join(self.save_folder, "best_pareto.pkl"),

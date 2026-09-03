@@ -1,0 +1,19 @@
+project: MSHNet-TG-SCA-CCRR
+experiment: TG1-Hybrid-Guard
+inherits_protocol: configs/ccrr_v2_target_guarded.yaml
+
+# Recommended first protected-design test after E2/E3 failed to improve E0.  This keeps
+# the proven Hybrid representation and isolates the new Guard from Tail and
+# FP-value interactions.  guard_alpha=0 makes Guard an independent veto while
+# preserving the original E1 selective-risk equation.
+# TG1 still includes the TG-SCA differentiable quality veto, so it is a full
+# protected-design validation rather than a one-variable Guard ablation.
+feature:
+  candidate_pooling: avg_max_topk
+
+selection:
+  guard_alpha: 0.0
+
+loss:
+  target_tail_weight: 0.0
+  fp_value_beta: 0.0

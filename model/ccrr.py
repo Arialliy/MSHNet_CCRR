@@ -812,6 +812,85 @@ class SelectiveReliabilityHead(nn.Module):
         }
 
 
+class TargetGuardedReliabilityHead(nn.Module):
+    """Predict clutter, target quality, and target-presence evidence separately.
+
+    The guard is intentionally independent from the continuous quality head:
+    a tiny or fragmented component can have low shape/localisation quality and
+    still contain a real target that must never be removed.  Zero-initialising
+    all three heads preserves the exact Keep/no-op startup contract.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.3,
+        zero_effect_initialization: bool = True,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0 or hidden_dim <= 0:
+            raise ValueError("input_dim and hidden_dim must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must lie in [0,1)")
+
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.shared = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+        )
+        self.clutter_head = nn.Linear(hidden_dim, 1)
+        self.quality_head = nn.Linear(hidden_dim, 1)
+        self.target_guard_head = nn.Linear(hidden_dim, 1)
+        if zero_effect_initialization:
+            for head in (
+                self.clutter_head,
+                self.quality_head,
+                self.target_guard_head,
+            ):
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
+
+    def forward(self, relation_features: Tensor) -> dict[str, Tensor]:
+        if relation_features.ndim != 2 or relation_features.shape[1] != self.input_dim:
+            raise ValueError(
+                f"relation_features must have shape [N,{self.input_dim}]"
+            )
+        if not torch.isfinite(relation_features).all():
+            raise ValueError("relation_features contain NaN or infinite values")
+
+        shared_feature = self.shared(relation_features)
+        clutter_logits = self.clutter_head(shared_feature).squeeze(1)
+        target_quality_logits = self.quality_head(shared_feature).squeeze(1)
+        target_guard_logits = self.target_guard_head(shared_feature).squeeze(1)
+        clutter_probability = clutter_logits.sigmoid()
+        target_quality = target_quality_logits.sigmoid()
+        target_guard = target_guard_logits.sigmoid()
+        for name, value in (
+            ("shared_feature", shared_feature),
+            ("clutter_logits", clutter_logits),
+            ("target_quality_logits", target_quality_logits),
+            ("target_guard_logits", target_guard_logits),
+            ("clutter_probability", clutter_probability),
+            ("target_quality", target_quality),
+            ("target_guard", target_guard),
+        ):
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{name} contains NaN or infinite values")
+        return {
+            "clutter_logits": clutter_logits,
+            "target_quality_logits": target_quality_logits,
+            "target_guard_logits": target_guard_logits,
+            "clutter_probability": clutter_probability,
+            "target_quality": target_quality,
+            "target_guard": target_guard,
+            "shared_feature": shared_feature,
+        }
+
+
 class ActionMaskEncoder(nn.Module):
     """Encode exact output-component shape and coarse confidence.
 
@@ -1400,6 +1479,140 @@ class SelectiveRiskGate(nn.Module):
             "clutter_logit": clutter_logit,
             "quality_logit": quality_logit,
         }
+
+
+class TargetGuardedRiskGate(nn.Module):
+    """Differentiable training veto and conservative hard evaluation rule."""
+
+    def __init__(
+        self,
+        risk_threshold: float = 2.0,
+        quality_veto_threshold: float = 0.2,
+        guard_veto_threshold: float = 0.2,
+        risk_alpha: float = 1.0,
+        guard_alpha: float = 1.0,
+        action_temperature: float = 0.05,
+        quality_temperature: float = 0.05,
+        guard_temperature: float = 0.05,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if not math.isfinite(risk_threshold):
+            raise ValueError("risk_threshold must be finite")
+        for name, value in (
+            ("quality_veto_threshold", quality_veto_threshold),
+            ("guard_veto_threshold", guard_veto_threshold),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must lie in [0,1]")
+        for name, value in (("risk_alpha", risk_alpha), ("guard_alpha", guard_alpha)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be non-negative and finite")
+        for name, value in (
+            ("action_temperature", action_temperature),
+            ("quality_temperature", quality_temperature),
+            ("guard_temperature", guard_temperature),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if not 0.0 < eps < 0.5:
+            raise ValueError("eps must lie in (0,0.5)")
+
+        self.risk_threshold = float(risk_threshold)
+        self.quality_veto_threshold = float(quality_veto_threshold)
+        self.guard_veto_threshold = float(guard_veto_threshold)
+        self.risk_alpha = float(risk_alpha)
+        self.guard_alpha = float(guard_alpha)
+        self.action_temperature = float(action_temperature)
+        self.quality_temperature = float(quality_temperature)
+        self.guard_temperature = float(guard_temperature)
+        self.eps = float(eps)
+
+    def _validate_probability(self, name: str, value: Tensor) -> None:
+        if value.ndim != 1:
+            raise ValueError(f"{name} must have shape [N]")
+        if not value.is_floating_point():
+            raise TypeError(f"{name} must be floating point")
+        if not torch.isfinite(value).all():
+            raise ValueError(f"{name} contains NaN or infinite values")
+        if (value < 0).any() or (value > 1).any():
+            raise ValueError(f"{name} must lie in [0,1]")
+
+    def forward(
+        self,
+        clutter_probability: Tensor,
+        target_quality: Tensor,
+        target_guard: Tensor,
+    ) -> dict[str, Tensor]:
+        self._validate_probability("clutter_probability", clutter_probability)
+        self._validate_probability("target_quality", target_quality)
+        self._validate_probability("target_guard", target_guard)
+        if target_quality.shape != clutter_probability.shape:
+            raise ValueError("target_quality must have the same shape as clutter_probability")
+        if target_guard.shape != clutter_probability.shape:
+            raise ValueError("target_guard must have the same shape as clutter_probability")
+        if target_quality.device != clutter_probability.device or target_guard.device != clutter_probability.device:
+            raise ValueError("all probability inputs must be on the same device")
+
+        clutter_logit = torch.logit(
+            clutter_probability.clamp(self.eps, 1.0 - self.eps)
+        )
+        quality_logit = torch.logit(target_quality.clamp(self.eps, 1.0 - self.eps))
+        guard_logit = torch.logit(target_guard.clamp(self.eps, 1.0 - self.eps))
+        risk_score = (
+            clutter_logit
+            - self.risk_alpha * quality_logit
+            - self.guard_alpha * guard_logit
+        )
+
+        raw_action = torch.sigmoid(
+            (risk_score - self.risk_threshold) / self.action_temperature
+        )
+        zero_action = torch.sigmoid(
+            risk_score.new_tensor(-self.risk_threshold / self.action_temperature)
+        )
+        soft_action = (
+            (raw_action - zero_action) / (1.0 - zero_action).clamp_min(self.eps)
+        ).clamp(0.0, 1.0)
+        soft_quality_allow = torch.sigmoid(
+            (self.quality_veto_threshold - target_quality)
+            / self.quality_temperature
+        )
+        soft_guard_allow = torch.sigmoid(
+            (self.guard_veto_threshold - target_guard) / self.guard_temperature
+        )
+        quality_veto = (target_quality <= self.quality_veto_threshold).to(
+            dtype=soft_action.dtype
+        )
+        guard_veto = (target_guard <= self.guard_veto_threshold).to(
+            dtype=soft_action.dtype
+        )
+
+        if self.training:
+            gate = soft_action * soft_quality_allow * soft_guard_allow
+        else:
+            gate = (
+                (risk_score >= self.risk_threshold)
+                & (target_quality <= self.quality_veto_threshold)
+                & (target_guard <= self.guard_veto_threshold)
+            ).to(dtype=soft_action.dtype)
+        outputs = {
+            "gate": gate,
+            "risk_score": risk_score,
+            "soft_action": soft_action,
+            "soft_quality_allow": soft_quality_allow,
+            "soft_guard_allow": soft_guard_allow,
+            "quality_veto": quality_veto,
+            "guard_veto": guard_veto,
+            "target_guard": target_guard,
+            "clutter_logit": clutter_logit,
+            "quality_logit": quality_logit,
+            "guard_logit": guard_logit,
+        }
+        for name, value in outputs.items():
+            if not torch.isfinite(value).all():
+                raise ValueError(f"{name} contains NaN or infinite values")
+        return outputs
 
 
 class ComponentAlignedSuppressor(nn.Module):
@@ -2088,7 +2301,14 @@ class SCACRRModule(nn.Module):
             ),
             dim=1,
         )
-        gate_outputs = self.risk_gate(clutter_scores, target_quality)
+        if "target_guard" in head_outputs:
+            gate_outputs = self.risk_gate(
+                clutter_scores,
+                target_quality,
+                head_outputs["target_guard"],
+            )
+        else:
+            gate_outputs = self.risk_gate(clutter_scores, target_quality)
         rectifier_outputs = self.rectifier(
             coarse_logits,
             gate_outputs["gate"],
@@ -2135,6 +2355,18 @@ class SCACRRModule(nn.Module):
             "peak_logits": rectifier_outputs["peak_logits"],
             "active_support": rectifier_outputs["active_support"],
         }
+        for key in (
+            "target_guard_logits",
+            "target_guard",
+            "guard_logit",
+            "guard_veto",
+            "soft_quality_allow",
+            "soft_guard_allow",
+        ):
+            if key in head_outputs:
+                candidate_outputs[key] = head_outputs[key]
+            elif key in gate_outputs:
+                candidate_outputs[key] = gate_outputs[key]
         if candidate_metadata is not None:
             candidate_outputs["candidate_metadata"] = candidate_metadata
             # Preserve useful per-candidate audit identifiers/scores at the
@@ -2145,17 +2377,105 @@ class SCACRRModule(nn.Module):
         return rectifier_outputs["refined_logits"], candidate_outputs
 
 
+class TargetGuardedSCACRRModule(SCACRRModule):
+    """SCA-CCRR with an independent high-recall target-presence veto."""
+
+    def __init__(
+        self,
+        feature_channels: int,
+        num_scales: int = 4,
+        roi_size: int | tuple[int, int] = 7,
+        hidden_dim: int = 64,
+        context_scale: float = 3.0,
+        min_context_size: float = 15.0,
+        dropout: float = 0.3,
+        risk_threshold: float = 2.0,
+        quality_veto_threshold: float = 0.2,
+        guard_veto_threshold: float = 0.2,
+        risk_alpha: float = 1.0,
+        guard_alpha: float = 1.0,
+        action_temperature: float = 0.05,
+        quality_temperature: float = 0.05,
+        guard_temperature: float = 0.05,
+        remove_threshold: float = 0.45,
+        output_threshold: float = 0.5,
+        mask_hidden_dim: int = 16,
+        eps: float = 1e-6,
+        zero_effect_initialization: bool = True,
+        pooling_mode: str = "avg_max_topk",
+        topk_ratio: float = 0.125,
+        minimum_topk: int = 1,
+    ) -> None:
+        super().__init__(
+            feature_channels=feature_channels,
+            num_scales=num_scales,
+            roi_size=roi_size,
+            hidden_dim=hidden_dim,
+            context_scale=context_scale,
+            min_context_size=min_context_size,
+            dropout=dropout,
+            risk_threshold=risk_threshold,
+            quality_veto_threshold=quality_veto_threshold,
+            risk_alpha=risk_alpha,
+            action_temperature=action_temperature,
+            remove_threshold=remove_threshold,
+            output_threshold=output_threshold,
+            mask_hidden_dim=mask_hidden_dim,
+            eps=eps,
+            zero_effect_initialization=zero_effect_initialization,
+            pooling_mode=pooling_mode,
+            topk_ratio=topk_ratio,
+            minimum_topk=minimum_topk,
+        )
+        relation_dim = (
+            self.encoder.output_dim
+            + self.mask_encoder.output_dim
+            + self.geometry_dim
+        )
+        base_head = self.reliability_head
+        # Reuse the already-created SCA shared/clutter/quality modules so a
+        # fixed seed gives TG-SCA exactly the same common initialization as
+        # E1.  Constructing the extra zero-initialized head inside fork_rng
+        # also prevents an otherwise irrelevant RNG offset in data shuffling
+        # and dropout streams.
+        with torch.random.fork_rng(devices=[]):
+            guarded_head = TargetGuardedReliabilityHead(
+                input_dim=relation_dim,
+                hidden_dim=hidden_dim,
+                dropout=dropout,
+                zero_effect_initialization=zero_effect_initialization,
+            )
+        guarded_head.shared = base_head.shared
+        guarded_head.clutter_head = base_head.clutter_head
+        guarded_head.quality_head = base_head.quality_head
+        self.reliability_head = guarded_head
+        self.risk_gate = TargetGuardedRiskGate(
+            risk_threshold=risk_threshold,
+            quality_veto_threshold=quality_veto_threshold,
+            guard_veto_threshold=guard_veto_threshold,
+            risk_alpha=risk_alpha,
+            guard_alpha=guard_alpha,
+            action_temperature=action_temperature,
+            quality_temperature=quality_temperature,
+            guard_temperature=guard_temperature,
+            eps=eps,
+        )
+
+
 __all__ = [
     "MaskedHybridPool",
     "CandidateContextEncoder",
     "ReliabilityHead",
     "SelectiveReliabilityHead",
+    "TargetGuardedReliabilityHead",
     "ActionMaskEncoder",
     "InstanceLogitRectifier",
     "SafeClutterSuppressor",
     "ThresholdAwareClutterSuppressor",
     "SelectiveRiskGate",
+    "TargetGuardedRiskGate",
     "ComponentAlignedSuppressor",
     "CCRRModule",
     "SCACRRModule",
+    "TargetGuardedSCACRRModule",
 ]

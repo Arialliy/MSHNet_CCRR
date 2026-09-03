@@ -477,6 +477,102 @@ class TargetQualityLoss(nn.Module):
         )
 
 
+class TargetGuardLoss(nn.Module):
+    """High-recall target-presence supervision for a destructive-action veto."""
+
+    def __init__(
+        self,
+        positive_weight: float = 4.0,
+        false_negative_weight: float = 2.0,
+        tail_temperature: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if not math.isfinite(positive_weight) or positive_weight <= 0:
+            raise ValueError("positive_weight must be positive and finite")
+        if not math.isfinite(false_negative_weight) or false_negative_weight < 0:
+            raise ValueError(
+                "false_negative_weight must be non-negative and finite"
+            )
+        if not math.isfinite(tail_temperature) or tail_temperature <= 0:
+            raise ValueError("tail_temperature must be positive and finite")
+        self.positive_weight = float(positive_weight)
+        self.false_negative_weight = float(false_negative_weight)
+        self.tail_temperature = float(tail_temperature)
+
+    def forward(
+        self,
+        guard_logits: Tensor,
+        guard_targets: Tensor,
+        valid: Tensor,
+    ) -> dict[str, Tensor]:
+        if not isinstance(guard_logits, Tensor):
+            raise TypeError("guard_logits must be a tensor")
+        if not isinstance(guard_targets, Tensor):
+            raise TypeError("guard_targets must be a tensor")
+        if not isinstance(valid, Tensor):
+            raise TypeError("valid must be a tensor")
+        if guard_logits.ndim != 1:
+            raise ValueError("guard_logits must have shape [N]")
+        if guard_targets.shape != guard_logits.shape:
+            raise ValueError("guard_targets must have the same shape as guard_logits")
+        if valid.shape != guard_logits.shape:
+            raise ValueError("valid must have the same shape as guard_logits")
+        if not guard_logits.is_floating_point() or not guard_targets.is_floating_point():
+            raise TypeError("guard logits and targets must be floating point")
+        if valid.dtype != torch.bool:
+            raise TypeError("valid must have dtype torch.bool")
+        if (
+            guard_targets.device != guard_logits.device
+            or valid.device != guard_logits.device
+        ):
+            raise ValueError("guard logits, targets, and valid must share a device")
+        if not torch.isfinite(guard_logits).all():
+            raise ValueError("guard_logits must be finite")
+        if not torch.isfinite(guard_targets).all():
+            raise ValueError("guard_targets must be finite")
+        if (guard_targets < 0).any() or (guard_targets > 1).any():
+            raise ValueError("guard_targets must lie in [0, 1]")
+
+        zero = _zero_loss(guard_logits)
+        if not valid.any():
+            return {
+                "total": zero,
+                "bce": zero,
+                "false_negative": zero,
+                "tail_false_negative": zero,
+            }
+
+        logits = guard_logits[valid]
+        targets = guard_targets[valid].to(dtype=logits.dtype)
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            targets,
+            pos_weight=logits.new_tensor(self.positive_weight),
+        )
+
+        false_negative = zero
+        tail_false_negative = zero
+        positive = targets > 0.5
+        if positive.any():
+            errors = 1.0 - torch.sigmoid(logits[positive])
+            false_negative = errors.mean()
+            temperature = self.tail_temperature
+            tail_false_negative = temperature * (
+                torch.logsumexp(errors / temperature, dim=0)
+                - math.log(errors.numel())
+            )
+
+        total = bce + self.false_negative_weight * (
+            false_negative + tail_false_negative
+        )
+        return {
+            "total": total,
+            "bce": bce,
+            "false_negative": false_negative,
+            "tail_false_negative": tail_false_negative,
+        }
+
+
 def _validate_component_membership(
     membership: Tensor,
     *,
@@ -1024,6 +1120,7 @@ __all__ = [
     "CandidateBinaryFocalLoss",
     "CandidateBrierLoss",
     "TargetQualityLoss",
+    "TargetGuardLoss",
     "AsymmetricActionRiskLoss",
     "CandidateRankLoss",
     "RectificationPreservationLoss",

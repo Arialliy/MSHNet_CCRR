@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections.abc import Mapping
 
-from model.ccrr import CCRRModule, SCACRRModule
+from model.ccrr import CCRRModule, SCACRRModule, TargetGuardedSCACRRModule
 from utils.candidate import generate_candidates, generate_component_aligned_candidates
 
 class ChannelAttention(nn.Module):
@@ -106,7 +106,10 @@ class MSHNet(nn.Module):
         else:
             ccrr_config = dict(ccrr_config)
             self.ccrr_variant = ccrr_config.pop('variant', 'v1_safe')
-            if self.ccrr_variant == 'v2_selective_component':
+            if self.ccrr_variant in (
+                'v2_selective_component',
+                'v2_target_guarded_component',
+            ):
                 feature_channels = int(ccrr_config.setdefault('feature_channels', 32))
                 if feature_channels <= 0 or feature_channels % 4 != 0:
                     raise ValueError(
@@ -122,7 +125,12 @@ class MSHNet(nn.Module):
                     nn.GroupNorm(4, feature_channels),
                     nn.ReLU(inplace=True),
                 )
-                self.ccrr = SCACRRModule(**ccrr_config)
+                module_class = (
+                    TargetGuardedSCACRRModule
+                    if self.ccrr_variant == 'v2_target_guarded_component'
+                    else SCACRRModule
+                )
+                self.ccrr = module_class(**ccrr_config)
             else:
                 if self.ccrr_variant not in ('v1_safe', 'v1_threshold_aware'):
                     raise ValueError(f'unsupported CCRR variant: {self.ccrr_variant!r}')
@@ -192,7 +200,10 @@ class MSHNet(nn.Module):
             raise RuntimeError('enable_ccrr=True requires ccrr_config when constructing MSHNet')
 
         generated_candidates = None
-        if self.ccrr_variant == 'v2_selective_component':
+        if self.ccrr_variant in (
+            'v2_selective_component',
+            'v2_target_guarded_component',
+        ):
             if self.ccrr_feature_adapter is None:
                 raise RuntimeError('SCA feature adapter is unavailable')
             ccrr_feature = self.ccrr_feature_adapter(
