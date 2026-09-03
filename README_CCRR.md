@@ -228,7 +228,7 @@ ECE, Brier, NLL, risk--coverage/AURC and FROC.
 
 ## Verification status
 
-- Full test suite: `131 passed`
+- Full test suite: `175 passed`
 - Full IRSTD-1K baseline regression: exact match to the stored baseline metrics
 - Baseline train/test entrypoints: exercised
 - CCRR explicit, online and empty-candidate forward/backward paths: exercised

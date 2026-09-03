@@ -2,8 +2,8 @@
 
 > **Status:** This document records the V1 safe baseline. V1.1 remains
 > reproducible through `configs/ccrr_v1_threshold_aware.yaml`; the current
-> released experimental implementation is SCA-CCRR, launched through
-> `scripts/run_ccrr_v2_selective_component.sh`.
+> released experimental implementation is SCA-CCRR V2-Enhanced, launched
+> through `scripts/run_ccrr_v2_enhanced.sh`.
 
 CCRR-V1 treats the previous 1000-epoch head-only run as a V0 diagnostic. Do
 not initialize joint training from a V0 best weight.

@@ -65,50 +65,40 @@ files are not used as fallbacks.
 
 This repository also contains the opt-in Candidate--Context Reliability
 Rectification extension.  The current released experimental implementation is
-SCA-CCRR (`v2_selective_component`), with component-aligned actions,
-multi-level features and a selective quality-veto head.  Run one dataset with:
-
-```bash
-CCRR_GPU=0 scripts/run_ccrr_v2_selective_component.sh
-```
-
-For all three datasets, use
-[`scripts/run_ccrr_v2_selective_component_all.sh`](scripts/run_ccrr_v2_selective_component_all.sh).
-The parameter reference is
-[`configs/ccrr_v2_selective_component.yaml`](configs/ccrr_v2_selective_component.yaml).
-
-The [CCRR-V2 design guide](Paper1_CCRR_V2_全指标提升方案与代码修改指南.md)
-records the motivation and staged roadmap.  Its SCA phase is implemented; the
-bidirectional Bi-CCRR recovery branch remains a proposal.  V1.1, the
-[V1 safe protocol](README_CCRR_V1.md) and [V0 execution guide](README_CCRR.md)
-remain reproducibility paths.  Baseline behavior remains the default; pass
-`--enable-ccrr --ccrr-version v2_selective_component` when launching SCA-CCRR
-without the provided runner.
-
-### SCA-CCRR V2-Enhanced
-
-The enhanced selective component-aligned variant adds masked
-Avg/Max/Top-K pooling, target-tail action protection, exact-component FP value
-weighting and a third non-inferior Pareto checkpoint.  Its frozen experiment
-configuration is
-[`configs/ccrr_v2_enhanced.yaml`](configs/ccrr_v2_enhanced.yaml).  Run the full
-E5 setting on one dataset with:
+SCA-CCRR V2-Enhanced.  It combines component-aligned actions, multi-level
+features and a selective quality-veto head with masked Avg/Max/Top-K pooling,
+target-tail protection, exact-component false-alarm value weighting and a
+third non-inferior Pareto checkpoint.  Run the full E5 setting on one dataset
+with:
 
 ```bash
 CCRR_DATASET_NAME=IRSTD-1K CCRR_GPU=0 scripts/run_ccrr_v2_enhanced.sh
 ```
 
-Set `CCRR_EXPERIMENT` to `E1`, `E2`, `E3`, `E4`, or `E5` for the registered
-ablation matrix.  The runner always uses the official train/test `img_idx`,
-1000 epochs, threshold 0.5, no independent validation split, and test-based
-selection after every epoch from epoch 500.  It retains `best_miou.pkl` and
-`best_pd.pkl`, and writes `best_pareto.pkl` only after all five non-inferiority
-constraints are met; `pareto_status.json` is written even when none is found.
-The three-dataset entrypoint is
+For all three datasets, use
 [`scripts/run_ccrr_v2_enhanced_all.sh`](scripts/run_ccrr_v2_enhanced_all.sh).
-When using an independent worktree, `CCRR_RESOURCE_REPO_DIR` may point to the
-checkout that contains the local datasets, baseline checkpoints and virtual
-environment.
+The parameter reference is
+[`configs/ccrr_v2_enhanced.yaml`](configs/ccrr_v2_enhanced.yaml).  Set
+`CCRR_EXPERIMENT` to `E1`, `E2`, `E3`, `E4`, or `E5` for the registered
+ablation matrix.
+
+The runner uses the official train/test `img_idx`, 1,000 epochs, threshold 0.5,
+no independent validation split, and test-based selection after every epoch
+from epoch 500.  It retains `best_miou.pkl` and `best_pd.pkl`, writes
+`best_pareto.pkl` only after all five non-inferiority constraints are met, and
+records `pareto_status.json` once scheduled evaluation begins.  In an
+independent worktree, `CCRR_RESOURCE_REPO_DIR` may point to the checkout
+containing local datasets, baseline checkpoints and the virtual environment.
+
+The base SCA-CCRR V2 remains reproducible through
+`scripts/run_ccrr_v2_selective_component.sh`; V1.1, the
+[V1 safe protocol](README_CCRR_V1.md) and [V0 execution guide](README_CCRR.md)
+remain reproducibility paths.  The
+[CCRR-V2 design guide](Paper1_CCRR_V2_全指标提升方案与代码修改指南.md)
+records the staged roadmap; the bidirectional Bi-CCRR recovery branch remains
+a proposal.  Baseline behavior remains the default.  Manual enhanced launches
+must include `--enable-ccrr --ccrr-version v2_selective_component` plus the
+enhanced pooling, loss and Pareto options captured by the runner.
 
 Datasets, checkpoints, candidate banks, predictions and run outputs are local
 artifacts and are intentionally excluded from version control.  Place or
