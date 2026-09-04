@@ -108,6 +108,22 @@ matches the full TargetGuard + Tail + FP-value configuration.  See
 TargetGuard Pareto selection additionally requires zero target deletion and at
 least 0.99 Guard recall.
 
+To queue the remaining TG1 runs (NUAA-SIRST followed by IRSTD-1K) on one
+automatically selected idle physical GPU, use:
+
+```bash
+CCRR_QUEUE_GPU_CANDIDATES="0 1" scripts/run_tg1_cross_dataset_queue.sh
+```
+
+The queue waits for any active formal run and retains the selected GPU across
+both datasets by default.  To run it intentionally beside another formal
+experiment, assign a separate GPU and disable only the global training lock:
+
+```bash
+CCRR_QUEUE_GPU_CANDIDATES=1 CCRR_QUEUE_WAIT_FOR_GLOBAL_LOCK=0 \
+  scripts/run_tg1_cross_dataset_queue.sh
+```
+
 The base SCA-CCRR V2 remains reproducible through
 `scripts/run_ccrr_v2_selective_component.sh`; V1.1, the
 [V1 safe protocol](README_CCRR_V1.md) and [V0 execution guide](README_CCRR.md)
