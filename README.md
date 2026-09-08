@@ -61,6 +61,18 @@ The dataset loader requires the official `img_idx/train_<dataset>.txt` and
 `img_idx/test_<dataset>.txt` manifests; root-level `trainval.txt`/`test.txt`
 files are not used as fallbacks.
 
+## Verification
+
+Run the complete automated test suite before starting an experiment:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+The current release is verified with `196 passed`.  See the
+[CCRR execution guide](README_CCRR.md#verification-status) for the exercised
+training, evaluation, checkpoint and resume paths.
+
 ## CCRR extension
 
 This repository also contains the opt-in Candidate--Context Reliability
