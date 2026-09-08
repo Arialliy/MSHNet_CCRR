@@ -66,6 +66,7 @@ files are not used as fallbacks.
 Run the complete automated test suite before starting an experiment:
 
 ```bash
+.venv/bin/python -m pip install pytest
 .venv/bin/python -m pytest -q
 ```
 
