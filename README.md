@@ -50,6 +50,14 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+If the repository uses a non-default SSH key, select it explicitly while
+cloning:
+
+```bash
+GIT_SSH_COMMAND="ssh -i /path/to/private_key -o IdentitiesOnly=yes" \
+  git clone git@github.com:Arialliy/MSHNet_CCRR.git
+```
+
 ## Testing
 You can test the model with the following command:
 ```
