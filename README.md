@@ -40,8 +40,12 @@ This repo also provides separate entrypoints:
 Training checkpoints and best weights are saved under `repro_runs/` by default.
 Both `--base-size` and `--crop-size` must be positive multiples of 16.
 
-For a fresh checkout, create a virtual environment and install all runtime dependencies with:
-```
+For a fresh checkout, clone this repository over SSH, then create a virtual
+environment and install all runtime dependencies:
+
+```bash
+git clone git@github.com:Arialliy/MSHNet_CCRR.git
+cd MSHNet_CCRR
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
@@ -122,9 +126,12 @@ TargetGuard Pareto selection additionally requires zero target deletion and at
 least 0.99 Guard recall.
 
 To queue the remaining TG1 runs (NUAA-SIRST followed by IRSTD-1K) on one
-automatically selected idle physical GPU, use:
+automatically selected idle physical GPU, run the following from the repository
+root.  If datasets, checkpoints and `.venv` live in another checkout, replace
+`$PWD` with that checkout path:
 
 ```bash
+export CCRR_RESOURCE_REPO_DIR="$PWD"
 CCRR_QUEUE_GPU_CANDIDATES="0 1" scripts/run_tg1_cross_dataset_queue.sh
 ```
 
